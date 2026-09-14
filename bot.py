@@ -1165,18 +1165,87 @@ async def receipt_menu(update, context):
     query = update.callback_query
 
     await query.answer()
-
     clear_state(context)
 
-    context.user_data[
-        "receipt_id"
-    ] = True
+    user_id = query.from_user.id
+    conn = db()
+    rows = conn.execute("""
+        SELECT id, reservation_name, first_name, amount, created_at
+        FROM requests
+        WHERE user_id = ?
+          AND status = 'reserved'
+          AND receipt_file_id IS NULL
+        ORDER BY id DESC
+        LIMIT 50
+    """, (user_id,)).fetchall()
+    conn.close()
+
+    if not rows:
+        await query.edit_message_text(
+            "🧾 *ارسال فیش*\n\n"
+            "❌ هیچ رزروی که هنوز فیش آن ارسال نشده باشد پیدا نشد.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
+        return
+
+    keyboard = []
+    for row in rows:
+        name = row["reservation_name"] or row["first_name"] or "بدون نام"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🧾 #{row['id']} | {name} | {fmt_amount(row['amount'])} تومان",
+                callback_data=f"receipt_select_{row['id']}",
+            )
+        ])
+
+    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
 
     await query.edit_message_text(
         "🧾 *ارسال فیش*\n\n"
-        "شناسه درخواست را وارد کنید.\n\n"
-        "مثال:\n"
-        "`12`",
+        "یکی از رزروهای بدون فیش را انتخاب کنید:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def receipt_select(update, context, request_id):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    conn = db()
+    request = conn.execute("""
+        SELECT id, status, receipt_file_id, amount, reservation_name, first_name
+        FROM requests
+        WHERE id = ?
+          AND user_id = ?
+    """, (request_id, user_id)).fetchone()
+    conn.close()
+
+    if not request:
+        await query.edit_message_text(
+            "❌ این رزرو پیدا نشد.",
+            reply_markup=back_button(),
+        )
+        return
+
+    if request["status"] != "reserved" or request["receipt_file_id"]:
+        await query.edit_message_text(
+            "❌ این رزرو دیگر برای ارسال فیش قابل انتخاب نیست.",
+            reply_markup=back_button(),
+        )
+        return
+
+    context.user_data["receipt_request"] = request_id
+
+    name = request["reservation_name"] or request["first_name"] or "-"
+    await query.edit_message_text(
+        "📎 *ارسال فیش*\n\n"
+        f"🆔 درخواست: `{request_id}`\n"
+        f"👤 نام رزرو: {name}\n"
+        f"💰 مبلغ: `{fmt_amount(request['amount'])}` تومان\n\n"
+        "حالا فیش پرداخت را به صورت عکس یا فایل ارسال کنید.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
     )
@@ -2776,6 +2845,14 @@ async def callback_router(
         )
         return
 
+    if data.startswith("receipt_select_"):
+        try:
+            request_id = int(data[len("receipt_select_"):])
+        except ValueError:
+            return
+        await receipt_select(update, context, request_id)
+        return
+
     # -----------------------------------------------------
     # HELP
     # -----------------------------------------------------
@@ -3131,10 +3208,43 @@ async def command_receipt(
     context,
 ):
     if not context.args:
+        user_id = update.effective_user.id
+        conn = db()
+        rows = conn.execute("""
+            SELECT id, reservation_name, first_name, amount
+            FROM requests
+            WHERE user_id = ?
+              AND status = 'reserved'
+              AND receipt_file_id IS NULL
+            ORDER BY id DESC
+            LIMIT 50
+        """, (user_id,)).fetchall()
+        conn.close()
+
+        if not rows:
+            await update.message.reply_text(
+                "🧾 *ارسال فیش*\n\n"
+                "❌ هیچ رزروی که هنوز فیش آن ارسال نشده باشد پیدا نشد.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=user_menu(),
+            )
+            return
+
+        keyboard = []
+        for row in rows:
+            name = row["reservation_name"] or row["first_name"] or "بدون نام"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🧾 #{row['id']} | {name} | {fmt_amount(row['amount'])} تومان",
+                    callback_data=f"receipt_select_{row['id']}",
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
+
         await update.message.reply_text(
-            "مثال:\n"
-            "`/receipt 12`",
+            "🧾 *ارسال فیش*\n\nیکی از رزروهای بدون فیش را انتخاب کنید:",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
@@ -3209,13 +3319,6 @@ async def text_router(
 
     if context.user_data.get("amount"):
         await receive_amount(
-            update,
-            context,
-        )
-        return
-
-    if context.user_data.get("receipt_id"):
-        await receive_receipt_id(
             update,
             context,
         )
