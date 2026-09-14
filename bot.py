@@ -315,6 +315,9 @@ def admin_menu():
             ),
         ],
         [
+        InlineKeyboardButton("🗑 پاک کردن کل تاریخچه", callback_data="a_clear_history"),
+        ],
+        [
             InlineKeyboardButton(
                 "🔎 جستجوی درخواست",
                 callback_data="a_search",
@@ -349,6 +352,76 @@ def back_button():
         ],
     ])
 
+##
+##
+##
+
+async def admin_clear_history_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("❌ لغو", callback_data="a_clear_cancel"),
+            InlineKeyboardButton("⚠️ بله، همه را پاک کن", callback_data="a_clear_confirm"),
+        ]
+    ]
+
+    await query.edit_message_text(
+        "⚠️ <b>هشدار خیلی مهم</b>\n\n"
+        "با تأیید این گزینه:\n\n"
+        "🗑 تمام درخواست‌ها حذف می‌شوند.\n"
+        "🗑 تمام حساب‌های پرداخت حذف می‌شوند.\n"
+        "🗑 تاریخچه درخواست‌ها از بین می‌رود.\n\n"
+        "❗ این عملیات قابل برگشت نیست.\n\n"
+        "آیا مطمئنی؟",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def admin_clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    conn = db()
+
+    try:
+        # پاک کردن تمام درخواست‌ها
+        conn.execute("DELETE FROM requests")
+
+        # پاک کردن تمام حساب‌ها
+        conn.execute("DELETE FROM payment_targets")
+
+        conn.commit()
+
+        await query.edit_message_text(
+            "✅ <b>تاریخچه با موفقیت پاک شد.</b>\n\n"
+            "🗑 تمام درخواست‌ها حذف شدند.\n"
+            "🗑 تمام حساب‌ها حذف شدند.\n"
+            "🧹 دیتای عملیاتی بات پاک‌سازی شد.",
+            parse_mode="HTML",
+            reply_markup=back_button()
+        )
+
+    except Exception as e:
+        conn.rollback()
+
+        await query.edit_message_text(
+            f"❌ خطا هنگام پاک کردن تاریخچه:\n\n"
+            f"<code>{e}</code>",
+            parse_mode="HTML",
+            reply_markup=back_button()
+        )
+
+    finally:
+        conn.close()
 
 # =========================================================
 # USER REQUEST STATUS MENU
@@ -2122,7 +2195,27 @@ async def callback_router(
             context,
         )
         return
+    if data == "a_clear_history":
+        await admin_clear_history_confirm(
+            update,
+            context,
+        )
+        return
 
+    if data == "a_clear_confirm":
+        await admin_clear_history(
+            update,
+            context,
+        )
+        return
+
+    if data == "a_clear_cancel":
+        await query.answer()
+        await query.edit_message_text(
+            "❌ عملیات پاک کردن لغو شد.",
+            reply_markup=admin_menu()
+        )
+        return
     # -----------------------------------------------------
     # RECEIPT REQUEST
     # -----------------------------------------------------
