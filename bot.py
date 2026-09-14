@@ -32,6 +32,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 ADMIN_IDS = {
+    A_CONTENT_ID = 7118132097
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip()
@@ -251,6 +252,8 @@ def fmt_amount(amount):
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+def is_a_content(user_id):
+    return user_id == A_CONTENT_ID
 
 def available_amount(target):
     return max(
@@ -341,6 +344,20 @@ def admin_menu():
         ],
     ])
 
+def a_content_menu():
+    keyboard = user_menu().inline_keyboard.copy()
+
+    keyboard.insert(
+        2,
+        [
+            InlineKeyboardButton(
+                "🧾 فیش‌های دریافتی",
+                callback_data="c_receipts",
+            ),
+        ],
+    )
+
+    return InlineKeyboardMarkup(keyboard)
 
 def back_button():
     return InlineKeyboardMarkup([
@@ -502,6 +519,14 @@ def menu_text(user):
             "🔐 دسترسی مدیریت فعال است."
         )
 
+    if is_a_content(user.id):
+        return (
+            "🤖 *ربات مدیریت پرداخت*\n\n"
+            "سلام 👋\n"
+            "گزینه موردنظر را انتخاب کنید.\n\n"
+            "🧾 دسترسی A Content فعال است."
+        )
+
     return (
         "🤖 *ربات مدیریت پرداخت*\n\n"
         "سلام 👋\n"
@@ -518,11 +543,12 @@ async def show_main_menu(
 
     user = update.effective_user
 
-    keyboard = (
-        admin_menu()
-        if is_admin(user.id)
-        else user_menu()
-    )
+    if is_admin(user.id):
+        keyboard = admin_menu()
+    elif is_a_content(user.id):
+        keyboard = a_content_menu()
+    else:
+        keyboard = user_menu()
 
     text = menu_text(user)
 
@@ -1152,13 +1178,159 @@ async def receive_receipt(
 # =========================================================
 # APPROVE
 # =========================================================
+async def a_content_receipts(update, context):
+    query = update.callback_query
 
+    await query.answer()
+
+    if not is_a_content(query.from_user.id):
+        return
+
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT
+            id,
+            user_id,
+            username,
+            first_name,
+            amount
+        FROM requests
+        WHERE status = 'reserved'
+        AND receipt_file_id IS NOT NULL
+        ORDER BY id ASC
+        LIMIT 50
+    """).fetchall()
+
+    conn.close()
+
+    if not rows:
+        await query.edit_message_text(
+            "🧾 *فیش‌های دریافتی*\n\n"
+            "در حال حاضر فیشی برای بررسی وجود ندارد.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
+        return
+
+    keyboard = []
+
+    for row in rows:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🧾 #{row['id']} | {fmt_amount(row['amount'])}",
+                callback_data=f"c_receipt_{row['id']}",
+            ),
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "⬅️ بازگشت",
+            callback_data="main",
+        ),
+    ])
+
+    await query.edit_message_text(
+        "🧾 *فیش‌های دریافتی*\n\n"
+        "یک فیش را برای بررسی انتخاب کنید:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+async def a_content_receipt_item(
+    update,
+    context,
+    request_id,
+):
+    query = update.callback_query
+
+    await query.answer()
+
+    if not is_a_content(query.from_user.id):
+        return
+
+    conn = db()
+
+    row = conn.execute("""
+        SELECT *
+        FROM requests
+        WHERE id = ?
+        AND status = 'reserved'
+        AND receipt_file_id IS NOT NULL
+    """, (
+        request_id,
+    )).fetchone()
+
+    conn.close()
+
+    if not row:
+        await query.edit_message_text(
+            "❌ این فیش پیدا نشد یا قبلاً بررسی شده است.",
+            reply_markup=back_button(),
+        )
+        return
+
+    text = (
+        "🧾 *بررسی فیش*\n\n"
+        f"🆔 درخواست: `{row['id']}`\n"
+        f"👤 {row['first_name'] or '-'}\n"
+        f"🔹 @{row['username'] or '-'}\n"
+        f"🔢 `{row['user_id']}`\n"
+        f"💰 `{fmt_amount(row['amount'])}` تومان\n\n"
+        "فیش را بررسی کنید:"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ تأیید",
+                callback_data=f"ok_{request_id}",
+            ),
+            InlineKeyboardButton(
+                "❌ رد",
+                callback_data=f"no_{request_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ برگشت",
+                callback_data="c_receipts",
+            ),
+        ],
+    ])
+
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+
+    # ارسال خود فایل فیش برای A Content
+    try:
+        if row["receipt_type"] == "photo":
+            await context.bot.send_photo(
+                query.from_user.id,
+                row["receipt_file_id"],
+                caption=f"🧾 فیش درخواست #{request_id}",
+            )
+        else:
+            await context.bot.send_document(
+                query.from_user.id,
+                row["receipt_file_id"],
+                caption=f"🧾 فیش درخواست #{request_id}",
+            )
+    except Exception:
+        pass
+    
 async def approve(update, context, request_id):
     query = update.callback_query
 
     await query.answer("✅ تأیید شد")
 
-    if not is_admin(query.from_user.id):
+    if not (
+        is_admin(query.from_user.id)
+        or is_a_content(query.from_user.id)
+    ):
         return
 
     conn = db()
@@ -1239,7 +1411,10 @@ async def reject(update, context, request_id):
 
     await query.answer("❌ رد شد")
 
-    if not is_admin(query.from_user.id):
+    if not (
+        is_admin(query.from_user.id)
+        or is_a_content(query.from_user.id)
+    ):
         return
 
     conn = db()
@@ -1585,6 +1760,9 @@ async def process_new_account(
     account = parts[1].strip()
     capacity = parse_amount(parts[2])
 
+    if capacity is not None:
+        capacity = capacity * 1_000_000
+        
     if not owner:
         await update.message.reply_text(
             "❌ نام خالی است."
@@ -2240,7 +2418,31 @@ async def callback_router(
             reply_markup=back_button(),
         )
         return
+        # -----------------------------------------------------
+    # A CONTENT RECEIPTS
+    # -----------------------------------------------------
 
+    if data == "c_receipts":
+        await a_content_receipts(
+            update,
+            context,
+        )
+        return
+
+    if data.startswith("c_receipt_"):
+        try:
+            request_id = int(
+                data[len("c_receipt_"):]
+            )
+        except ValueError:
+            return
+
+        await a_content_receipt_item(
+            update,
+            context,
+            request_id,
+        )
+        return
     # -----------------------------------------------------
     # APPROVE
     # -----------------------------------------------------
@@ -2342,12 +2544,13 @@ async def command_getaccount(
         context.args[0]
     )
 
+
     if amount is None:
         await update.message.reply_text(
             "❌ مبلغ نامعتبر است."
         )
         return
-
+    amount = amount * 1_000_000
     await create_request(
         update,
         context,
