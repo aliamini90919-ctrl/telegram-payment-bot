@@ -1,0 +1,4 @@
+.env
+payments.db
+__pycache__/
+*.pyc
