@@ -316,6 +316,16 @@ def admin_menu():
         ],
         [
             InlineKeyboardButton(
+                "🔎 جستجوی درخواست",
+                callback_data="a_search",
+            ),
+            InlineKeyboardButton(
+                "📈 گزارش درخواست‌ها",
+                callback_data="a_report",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 "📜 تاریخچه",
                 callback_data="a_history",
             ),
@@ -470,6 +480,108 @@ async def start(update, context):
 
 
 # =========================================================
+# SMART REQUEST QUEUE
+# =========================================================
+
+def assign_waiting_requests(conn, target_id=None):
+    """اختصاص هوشمند درخواست‌های waiting بدون قفل شدن صف."""
+    assigned = []
+
+    sql = """
+        SELECT *
+        FROM payment_targets
+        WHERE active = 1
+    """
+    params = ()
+
+    if target_id is not None:
+        sql += " AND id = ?"
+        params = (target_id,)
+
+    sql += " ORDER BY id ASC"
+
+    for target in conn.execute(sql, params).fetchall():
+        available = available_amount(target)
+
+        while available > 0:
+            # اگر درخواست اول جا نشود، درخواست‌های کوچک‌تر بررسی می‌شوند.
+            request = conn.execute("""
+                SELECT *
+                FROM requests
+                WHERE status = 'waiting'
+                  AND amount <= ?
+                ORDER BY id ASC
+                LIMIT 1
+            """, (available,)).fetchone()
+
+            if not request:
+                break
+
+            result = conn.execute("""
+                UPDATE requests
+                SET target_id = ?,
+                    status = 'reserved',
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'waiting'
+            """, (target["id"], now_iso(), request["id"]))
+
+            if result.rowcount != 1:
+                continue
+
+            conn.execute("""
+                UPDATE payment_targets
+                SET reserved_amount = reserved_amount + ?
+                WHERE id = ?
+            """, (request["amount"], target["id"]))
+
+            assigned.append({
+                "request_id": request["id"],
+                "user_id": request["user_id"],
+                "amount": request["amount"],
+                "target_id": target["id"],
+                "owner_name": target["owner_name"],
+                "account_number": target["account_number"],
+            })
+
+            available -= int(request["amount"])
+
+    return assigned
+
+
+async def notify_assigned_requests(bot, assigned):
+    for item in assigned:
+        try:
+            await bot.send_message(
+                item["user_id"],
+                "🎉 *حساب برای شما آماده شد!*\n\n"
+                f"🆔 درخواست: `{item['request_id']}`\n"
+                f"👤 صاحب حساب: `{item['owner_name']}`\n"
+                f"🏦 شماره حساب:\n`{item['account_number']}`\n\n"
+                f"💰 مبلغ: `{fmt_amount(item['amount'])}` تومان\n\n"
+                "درخواست شما طبق نوبت هوشمند به این حساب اختصاص یافت.\n"
+                "پس از پرداخت، فیش را ارسال کنید.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🧾 ارسال فیش",
+                            callback_data=f"r_{item['request_id']}",
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 درخواست‌های من",
+                            callback_data="u_requests",
+                        ),
+                    ],
+                ]),
+            )
+        except Exception:
+            pass
+
+
+# =========================================================
 # GET ACCOUNT
 # =========================================================
 
@@ -527,90 +639,59 @@ async def create_request(
     amount,
 ):
     user = update.effective_user
-
     conn = db()
-
-    targets = conn.execute("""
-        SELECT *
-        FROM payment_targets
-        WHERE active = 1
-        AND (
-            capacity
-            - reserved_amount
-            - paid_amount
-        ) >= ?
-        ORDER BY id ASC
-        LIMIT 1
-    """, (
-        amount,
-    )).fetchone()
-
     created = now_iso()
 
-    # -----------------------------------------------------
-    # ACCOUNT FOUND
-    # -----------------------------------------------------
-
-    if targets:
-
-        cursor = conn.execute("""
-            INSERT INTO requests (
-                user_id,
-                username,
-                first_name,
-                amount,
-                target_id,
-                status,
-                created_at,
-                updated_at
-            )
-            VALUES (
-                ?, ?, ?, ?, ?, 'reserved', ?, ?
-            )
-        """, (
-            user.id,
-            user.username,
-            user.first_name,
-            amount,
-            targets["id"],
-            created,
-            created,
-        ))
-
-        request_id = cursor.lastrowid
-
-        conn.execute("""
-            UPDATE payment_targets
-            SET reserved_amount =
-                reserved_amount + ?
-            WHERE id = ?
-        """, (
-            amount,
-            targets["id"],
-        ))
-
-        conn.commit()
-
-        remaining = (
-            int(targets["capacity"])
-            - int(targets["reserved_amount"])
-            - int(targets["paid_amount"])
-            - amount
+    cursor = conn.execute("""
+        INSERT INTO requests (
+            user_id, username, first_name, amount,
+            status, created_at, updated_at
         )
+        VALUES (?, ?, ?, ?, 'waiting', ?, ?)
+    """, (
+        user.id,
+        user.username,
+        user.first_name,
+        amount,
+        created,
+        created,
+    ))
 
+    request_id = cursor.lastrowid
+
+    # تمام درخواست‌های waiting را دوباره بررسی می‌کنیم.
+    # انتخاب، قدیمی‌ترین درخواستِ قابل انجام است؛
+    # بنابراین یک درخواست ۵۰۰۰ تومانی جلوی درخواست ۱۰۰۰ تومانی را نمی‌گیرد.
+    assigned = assign_waiting_requests(conn)
+    conn.commit()
+
+    current = next(
+        (x for x in assigned if x["request_id"] == request_id),
+        None,
+    )
+
+    if current:
+        target = conn.execute("""
+            SELECT capacity, reserved_amount, paid_amount
+            FROM payment_targets
+            WHERE id = ?
+        """, (current["target_id"],)).fetchone()
+
+        remaining = max(
+            0,
+            int(target["capacity"])
+            - int(target["reserved_amount"])
+            - int(target["paid_amount"]),
+        )
         conn.close()
 
         await update.message.reply_text(
             "✅ *حساب برای شما اختصاص داده شد*\n\n"
             f"🆔 درخواست: `{request_id}`\n\n"
-            f"👤 صاحب حساب:\n"
-            f"`{targets['owner_name']}`\n\n"
-            f"🏦 شماره حساب:\n"
-            f"`{targets['account_number']}`\n\n"
-            f"💰 مبلغ:\n"
-            f"`{fmt_amount(amount)}` تومان\n\n"
-            f"📊 باقی‌مانده:\n"
-            f"`{fmt_amount(max(0, remaining))}` تومان\n\n"
+            f"👤 صاحب حساب:\n`{current['owner_name']}`\n\n"
+            f"🏦 شماره حساب:\n`{current['account_number']}`\n\n"
+            f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n"
+            f"📊 باقی‌مانده: `{fmt_amount(remaining)}` تومان\n\n"
             "پس از پرداخت، فیش را ارسال کنید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
@@ -635,67 +716,36 @@ async def create_request(
             ]),
         )
 
+        others = [
+            x for x in assigned
+            if x["request_id"] != request_id
+        ]
+        await notify_assigned_requests(context.bot, others)
         return
-
-    # -----------------------------------------------------
-    # WAITING
-    # -----------------------------------------------------
-
-    cursor = conn.execute("""
-        INSERT INTO requests (
-            user_id,
-            username,
-            first_name,
-            amount,
-            status,
-            created_at,
-            updated_at
-        )
-        VALUES (
-            ?, ?, ?, ?, 'waiting', ?, ?
-        )
-    """, (
-        user.id,
-        user.username,
-        user.first_name,
-        amount,
-        created,
-        created,
-    ))
-
-    request_id = cursor.lastrowid
 
     max_available = conn.execute("""
         SELECT COALESCE(
-            MAX(
-                capacity
-                - reserved_amount
-                - paid_amount
-            ),
-            0
-        )
-        AS max_available
+            MAX(capacity - reserved_amount - paid_amount), 0
+        ) AS max_available
         FROM payment_targets
         WHERE active = 1
     """).fetchone()["max_available"]
 
-    conn.commit()
     conn.close()
 
     await update.message.reply_text(
         "⏳ *درخواست شما در صف انتظار قرار گرفت*\n\n"
         f"🆔 درخواست: `{request_id}`\n"
         f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\n"
-        "در حال حاضر حساب مناسبی وجود ندارد.\n\n"
-        f"📊 بیشترین ظرفیت فعلی:\n"
-        f"`{fmt_amount(max_available)}` تومان\n\n"
-        "🔔 با اضافه شدن حساب مناسب، "
-        "درخواست شما خودکار اختصاص داده می‌شود.",
+        "فعلاً حساب مناسبی برای این مبلغ وجود ندارد.\n\n"
+        f"📊 بیشترین ظرفیت فعلی: `{fmt_amount(max_available)}` تومان\n\n"
+        "🧠 درخواست شما وارد صف هوشمند شد. اگر درخواست بزرگ‌تری "
+        "قابل انجام نباشد، درخواست‌های کوچک‌تر متوقف نمی‌شوند.\n\n"
+        "🔔 به محض پیدا شدن حساب مناسب، مشخصات حساب برای شما ارسال می‌شود.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
     )
 
-    # اطلاع ادمین‌ها
     admin_text = (
         "🚨 *درخواست جدید*\n\n"
         f"🆔 `{request_id}`\n"
@@ -703,7 +753,7 @@ async def create_request(
         f"🔹 @{user.username or '-'}\n"
         f"🔢 `{user.id}`\n"
         f"💰 `{fmt_amount(amount)}` تومان\n\n"
-        "⚠️ حساب مناسب موجود نیست."
+        "⚠️ هنوز حساب مناسبی اختصاص نیافته است."
     )
 
     for admin_id in ADMIN_IDS:
@@ -1161,8 +1211,17 @@ async def reject(update, context, request_id):
             request["target_id"],
         ))
 
+    # با آزاد شدن ظرفیت، صف هوشمند دوباره اجرا می‌شود.
+    assigned = []
+    if request["target_id"]:
+        assigned = assign_waiting_requests(
+            conn,
+            target_id=request["target_id"],
+        )
+
     conn.commit()
     conn.close()
+
 
     try:
         await query.edit_message_reply_markup(
@@ -1182,6 +1241,8 @@ async def reject(update, context, request_id):
         )
     except Exception:
         pass
+
+    await notify_assigned_requests(context.bot, assigned)
 
 
 # =========================================================
@@ -1493,51 +1554,8 @@ async def process_new_account(
 
     target_id = cursor.lastrowid
 
-    waiting = conn.execute("""
-        SELECT *
-        FROM requests
-        WHERE status = 'waiting'
-        ORDER BY id ASC
-    """).fetchall()
-
-    assigned = []
-
-    for request in waiting:
-
-        target = conn.execute("""
-            SELECT *
-            FROM payment_targets
-            WHERE id = ?
-        """, (
-            target_id,
-        )).fetchone()
-
-        if available_amount(target) < request["amount"]:
-            continue
-
-        conn.execute("""
-            UPDATE requests
-            SET target_id = ?,
-                status = 'reserved',
-                updated_at = ?
-            WHERE id = ?
-        """, (
-            target_id,
-            now_iso(),
-            request["id"],
-        ))
-
-        conn.execute("""
-            UPDATE payment_targets
-            SET reserved_amount =
-                reserved_amount + ?
-            WHERE id = ?
-        """, (
-            request["amount"],
-            target_id,
-        ))
-
-        assigned.append(dict(request))
+    # پس از اضافه شدن حساب، صف هوشمند را روی همین حساب اجرا می‌کنیم.
+    assigned = assign_waiting_requests(conn, target_id=target_id)
 
     conn.commit()
     conn.close()
@@ -1555,31 +1573,220 @@ async def process_new_account(
         reply_markup=admin_menu(),
     )
 
-    # اطلاع کاربران
-    for request in assigned:
-        try:
-            await context.bot.send_message(
-                request["user_id"],
-                "🎉 *حساب برای شما آماده شد!*\n\n"
-                f"🆔 درخواست: `{request['id']}`\n"
-                f"👤 صاحب حساب: `{owner}`\n"
-                f"🏦 شماره حساب:\n"
-                f"`{account}`\n\n"
-                f"💰 مبلغ:\n"
-                f"`{fmt_amount(request['amount'])}` تومان\n\n"
-                "پس از پرداخت، فیش را ارسال کنید.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "🧾 ارسال فیش",
-                            callback_data=f"r_{request['id']}",
-                        ),
-                    ],
-                ]),
-            )
-        except Exception:
-            pass
+    await notify_assigned_requests(
+        context.bot,
+        assigned,
+    )
+
+
+# =========================================================
+# ADMIN SEARCH
+# =========================================================
+
+async def admin_search_menu(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    clear_state(context)
+    context.user_data["admin_search"] = True
+
+    await query.edit_message_text(
+        "🔎 *جستجوی درخواست*\n\n"
+        "شناسه درخواست، شناسه کاربر، username، نام کاربر یا مبلغ را وارد کنید.\n\n"
+        "مثال: `125` یا `@ali` یا `5000000`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_button(),
+    )
+
+
+async def process_admin_search(update, context):
+    if not context.user_data.get("admin_search"):
+        return
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    term = update.message.text.strip()
+    clean = term.lstrip("@").replace(",", "")
+    like = f"%{clean}%"
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT r.*, p.owner_name, p.account_number
+        FROM requests r
+        LEFT JOIN payment_targets p ON p.id = r.target_id
+        WHERE CAST(r.id AS TEXT) = ?
+           OR CAST(r.user_id AS TEXT) = ?
+           OR COALESCE(r.username, '') LIKE ?
+           OR COALESCE(r.first_name, '') LIKE ?
+           OR CAST(r.amount AS TEXT) = ?
+        ORDER BY r.id DESC
+        LIMIT 50
+    """, (clean, clean, like, like, clean)).fetchall()
+    conn.close()
+
+    clear_state(context)
+
+    names = {
+        "waiting": "⏳ در انتظار حساب",
+        "reserved": "🟡 رزرو شده",
+        "paid": "🟢 تایید شده",
+        "rejected": "🔴 رد شده",
+    }
+
+    if not rows:
+        await update.message.reply_text(
+            "🔎 نتیجه‌ای پیدا نشد.",
+            reply_markup=admin_menu(),
+        )
+        return
+
+    parts = ["🔎 *نتایج جستجو*\n"]
+    for row in rows:
+        parts.append(
+            f"🆔 `{row['id']}` | 💰 `{fmt_amount(row['amount'])}` تومان\n"
+            f"👤 {row['first_name'] or '-'} | @{row['username'] or '-'}\n"
+            f"🔢 کاربر: `{row['user_id']}`\n"
+            f"📌 {names.get(row['status'], row['status'])}\n"
+            f"🏦 {row['owner_name'] or '-'}\n"
+            "━━━━━━━━━━━━━━"
+        )
+
+    await update.message.reply_text(
+        "\n".join(parts),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_menu(),
+    )
+
+
+# =========================================================
+# ADMIN REQUEST REPORT
+# =========================================================
+
+async def admin_report(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
+    s = conn.execute("""
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(amount), 0) AS total_amount,
+            SUM(CASE WHEN status='waiting' THEN 1 ELSE 0 END) AS waiting_count,
+            COALESCE(SUM(CASE WHEN status='waiting' THEN amount ELSE 0 END),0) AS waiting_amount,
+            SUM(CASE WHEN status='reserved' THEN 1 ELSE 0 END) AS reserved_count,
+            COALESCE(SUM(CASE WHEN status='reserved' THEN amount ELSE 0 END),0) AS reserved_amount,
+            SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) AS paid_count,
+            COALESCE(SUM(CASE WHEN status='paid' THEN amount ELSE 0 END),0) AS paid_amount,
+            SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rejected_count,
+            COALESCE(SUM(CASE WHEN status='rejected' THEN amount ELSE 0 END),0) AS rejected_amount
+        FROM requests
+    """).fetchone()
+
+    t = conn.execute("""
+        SELECT
+            COUNT(*) AS total_accounts,
+            COALESCE(SUM(active),0) AS active_accounts,
+            COALESCE(SUM(capacity),0) AS capacity,
+            COALESCE(SUM(reserved_amount),0) AS reserved,
+            COALESCE(SUM(paid_amount),0) AS paid
+        FROM payment_targets
+    """).fetchone()
+    conn.close()
+
+    text = (
+        "📈 *گزارش کامل درخواست‌ها*\n\n"
+        f"📌 کل درخواست‌ها: `{s['total']}`\n"
+        f"💰 مجموع مبالغ: `{fmt_amount(s['total_amount'])}` تومان\n\n"
+        "━━━━━━━━━━━━━━\n"
+        f"⏳ در انتظار حساب: `{s['waiting_count'] or 0}`\n"
+        f"💰 `{fmt_amount(s['waiting_amount'])}` تومان\n\n"
+        f"🟡 رزرو شده: `{s['reserved_count'] or 0}`\n"
+        f"💰 `{fmt_amount(s['reserved_amount'])}` تومان\n\n"
+        f"🟢 تایید شده: `{s['paid_count'] or 0}`\n"
+        f"💰 `{fmt_amount(s['paid_amount'])}` تومان\n\n"
+        f"🔴 رد شده: `{s['rejected_count'] or 0}`\n"
+        f"💰 `{fmt_amount(s['rejected_amount'])}` تومان\n\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🏦 کل حساب‌ها: `{t['total_accounts'] or 0}`\n"
+        f"🟢 حساب‌های فعال: `{t['active_accounts'] or 0}`\n"
+        f"💳 ظرفیت کل: `{fmt_amount(t['capacity'])}` تومان\n"
+        f"🟡 رزرو: `{fmt_amount(t['reserved'])}` تومان\n"
+        f"🟢 پرداخت: `{fmt_amount(t['paid'])}` تومان"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏳ در انتظار حساب", callback_data="ar_waiting")],
+        [
+            InlineKeyboardButton("🟡 رزرو شده", callback_data="ar_reserved"),
+            InlineKeyboardButton("🟢 تایید شده", callback_data="ar_paid"),
+        ],
+        [InlineKeyboardButton("🔴 رد شده", callback_data="ar_rejected")],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="main")],
+    ])
+
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+
+
+async def admin_report_by_status(update, context, status):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    names = {
+        "waiting": "⏳ در انتظار حساب",
+        "reserved": "🟡 رزرو شده / در انتظار فیش",
+        "paid": "🟢 تایید شده",
+        "rejected": "🔴 رد شده",
+    }
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT id, user_id, username, first_name, amount, target_id
+        FROM requests
+        WHERE status = ?
+        ORDER BY id ASC
+        LIMIT 100
+    """, (status,)).fetchall()
+    conn.close()
+
+    parts = [
+        f"📋 *{names[status]}*",
+        f"تعداد: `{len(rows)}`",
+        "",
+    ]
+
+    for row in rows:
+        parts.append(
+            f"🆔 `{row['id']}` | 💰 `{fmt_amount(row['amount'])}` تومان\n"
+            f"👤 {row['first_name'] or '-'} | @{row['username'] or '-'}\n"
+            f"🔢 کاربر: `{row['user_id']}` | 🏦 حساب: `{row['target_id'] or '-'}`\n"
+            "━━━━━━━━━━━━━━"
+        )
+
+    if not rows:
+        parts.append("درخواستی در این بخش وجود ندارد.")
+
+    await query.edit_message_text(
+        "\n".join(parts),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📈 گزارش کلی", callback_data="a_report")],
+            [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
+        ]),
+    )
 
 
 # =========================================================
@@ -1836,11 +2043,40 @@ async def callback_router(
         await query.edit_message_text(
             "ℹ️ *راهنما*\n\n"
             "💰 مبلغ را وارد کنید تا حساب مناسب اختصاص داده شود.\n\n"
+            "🧠 صف هوشمند است؛ درخواست بزرگ‌تر جلوی درخواست کوچک‌ترِ قابل‌انجام را نمی‌گیرد.\n\n"
             "🧾 پس از پرداخت، فیش را ارسال کنید.\n\n"
             "📋 از بخش درخواست‌های من می‌توانید وضعیت را ببینید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_button(),
         )
+        return
+
+    # -----------------------------------------------------
+    # ADMIN SEARCH / REPORT
+    # -----------------------------------------------------
+
+    if data == "a_search":
+        await admin_search_menu(update, context)
+        return
+
+    if data == "a_report":
+        await admin_report(update, context)
+        return
+
+    if data == "ar_waiting":
+        await admin_report_by_status(update, context, "waiting")
+        return
+
+    if data == "ar_reserved":
+        await admin_report_by_status(update, context, "reserved")
+        return
+
+    if data == "ar_paid":
+        await admin_report_by_status(update, context, "paid")
+        return
+
+    if data == "ar_rejected":
+        await admin_report_by_status(update, context, "rejected")
         return
 
     # -----------------------------------------------------
@@ -2113,6 +2349,13 @@ async def text_router(
 
     if context.user_data.get("new_account"):
         await process_new_account(
+            update,
+            context,
+        )
+        return
+
+    if context.user_data.get("admin_search"):
+        await process_admin_search(
             update,
             context,
         )
