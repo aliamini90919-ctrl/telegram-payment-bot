@@ -11,7 +11,7 @@ import httpx
 # =========================================================
 # BALE CONFIG
 # =========================================================
-BOT_TOKEN = "1877548228:PL0XsIcN_pkbn6oG9V_xpNkB2SCw2t9jyxU"
+BOT_TOKEN = "1877548228:5p2NkF84cCLcVGcw-RMCb3ySvwlBUHytmDI"
 ADMIN_IDS = {
     1962675244,
     1000885670,
