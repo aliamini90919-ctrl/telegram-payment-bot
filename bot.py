@@ -1,10 +1,9 @@
+import asyncio
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
-
-from dotenv import load_dotenv
 
 from telegram import (
     Update,
@@ -27,21 +26,35 @@ from telegram.request import HTTPXRequest
 # CONFIG
 # =========================================================
 
-load_dotenv()
+# =========================================================
+# تنظیمات اصلی — بدون نیاز به فایل .env
+# =========================================================
+# توکن همین ربات را اینجا قرار بده.
+BOT_TOKEN = "8645757475:AAF6TaTOhhBB5EQ5rbvYybG5yKwNj8ErO9U"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
+# شناسه عددی ادمین‌های اصلی
 ADMIN_IDS = {
-    A_CONTENT_ID = 7118132097
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip()
+    8947012753,
+    418908614,
 }
 
-DB_PATH = os.getenv(
-    "DB_PATH",
-    "payments.db",
-)
+# رمز /adpass برای تبدیل کاربر عادی به ادمین
+ADPASS_PASSWORD = "@dm1nP@33w0rd"
+
+# ادمین‌هایی که از طریق /adpass ارتقا پیدا کرده‌اند؛ در دیتابیس هم ذخیره می‌شوند.
+PROMOTED_ADMIN_IDS = set()
+
+# فایل دیتابیس این ربات
+DB_PATH = "payments.db"
+
+# تنها کاربری که نقش A Content دارد
+A_CONTENT_ID = 7118132097
+
+# اعداد ورودی کاربر/سقف حساب بر حسب «میلیون تومان» هستند.
+AMOUNT_MULTIPLIER = 1_000_000
+
+REMINDER_INTERVAL_SECONDS = 3600
+REMINDER_AFTER_HOURS = 24
 
 
 # =========================================================
@@ -117,13 +130,16 @@ def init_db():
         user_id INTEGER NOT NULL,
         username TEXT,
         first_name TEXT,
+        reservation_name TEXT,
+        account_number_snapshot TEXT,
         amount INTEGER NOT NULL,
         target_id INTEGER,
         status TEXT NOT NULL DEFAULT 'waiting',
         receipt_file_id TEXT,
         receipt_type TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        next_reminder_at TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_requests_user
@@ -137,7 +153,17 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_targets_active
         ON payment_targets(active);
+
+    CREATE TABLE IF NOT EXISTS promoted_admins (
+        user_id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL
+    );
     """)
+
+    # ادمین‌های ایجادشده با /adpass را بعد از هر راه‌اندازی بارگذاری کن.
+    PROMOTED_ADMIN_IDS.clear()
+    for row in conn.execute("SELECT user_id FROM promoted_admins").fetchall():
+        PROMOTED_ADMIN_IDS.add(int(row["user_id"]))
 
     # -----------------------------------------------------
     # Migration
@@ -157,6 +183,12 @@ def init_db():
         "first_name":
             "ALTER TABLE requests ADD COLUMN first_name TEXT",
 
+        "reservation_name":
+            "ALTER TABLE requests ADD COLUMN reservation_name TEXT",
+
+        "account_number_snapshot":
+            "ALTER TABLE requests ADD COLUMN account_number_snapshot TEXT",
+
         "target_id":
             "ALTER TABLE requests ADD COLUMN target_id INTEGER",
 
@@ -174,6 +206,9 @@ def init_db():
 
         "updated_at":
             "ALTER TABLE requests ADD COLUMN updated_at TEXT",
+
+        "next_reminder_at":
+            "ALTER TABLE requests ADD COLUMN next_reminder_at TEXT",
     }
 
     for column, sql in migrations.items():
@@ -211,6 +246,41 @@ def init_db():
             except sqlite3.OperationalError:
                 pass
 
+    # برای درخواست‌های قدیمی، اگر شماره حساب زمان رزرو ذخیره نشده
+    # باشد، از شماره فعلی حساب به عنوان نزدیک‌ترین مقدار ممکن استفاده می‌کنیم.
+    try:
+        conn.execute("""
+            UPDATE requests
+            SET account_number_snapshot = (
+                SELECT account_number
+                FROM payment_targets
+                WHERE payment_targets.id = requests.target_id
+            )
+            WHERE target_id IS NOT NULL
+              AND (account_number_snapshot IS NULL OR account_number_snapshot = '')
+        """)
+    except sqlite3.OperationalError:
+        pass
+
+    # درخواست‌های قدیمی که حساب گرفته‌اند ولی هنوز فیش ندارند،
+    # از زمان اجرای فعلی ۲۴ ساعت بعد اولین یادآوری را می‌گیرند.
+    try:
+        old_pending = conn.execute("""
+            SELECT id
+            FROM requests
+            WHERE status = 'reserved'
+              AND receipt_file_id IS NULL
+              AND next_reminder_at IS NULL
+        """).fetchall()
+        for old_row in old_pending:
+            conn.execute("""
+                UPDATE requests
+                SET next_reminder_at = ?
+                WHERE id = ?
+            """, (reminder_due(), old_row['id']))
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -224,24 +294,41 @@ def now_iso():
 
 
 def parse_amount(value):
+    """Parse a user/admin amount in million Toman and return whole Toman.
+
+    Examples: 11 -> 11,000,000 ; 11.5 -> 11,500,000
+    Supports Persian/Arabic digits and decimal separator (٫).
+    """
     value = str(value).strip()
 
-    value = value.replace(",", "")
+    # Persian/Arabic-Indic digits -> ASCII digits
+    translation = str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+        "01234567890123456789",
+    )
+    value = value.translate(translation)
+    value = value.replace("٫", ".")
     value = value.replace("٬", "")
     value = value.replace(" ", "")
 
+    # A comma is treated as a thousands separator, matching the old behavior.
+    value = value.replace(",", "")
+
     try:
-        amount = Decimal(value)
+        amount_million = Decimal(value)
 
-        if amount <= 0:
+        if amount_million <= 0:
             return None
 
-        if amount != amount.to_integral_value():
+        # Convert million-Toman input to whole Toman. Decimal avoids float errors.
+        amount_toman = amount_million * Decimal(AMOUNT_MULTIPLIER)
+
+        if amount_toman != amount_toman.to_integral_value():
             return None
 
-        return int(amount)
+        return int(amount_toman)
 
-    except (InvalidOperation, ValueError):
+    except (InvalidOperation, ValueError, TypeError):
         return None
 
 
@@ -250,10 +337,60 @@ def fmt_amount(amount):
 
 
 def is_admin(user_id):
-    return user_id in ADMIN_IDS
+    return user_id in ADMIN_IDS or user_id in PROMOTED_ADMIN_IDS
+
+
+def promote_to_admin(user_id):
+    """ثبت دائمی کاربر به‌عنوان ادمین."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO promoted_admins (user_id, created_at) VALUES (?, ?)",
+            (user_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    PROMOTED_ADMIN_IDS.add(user_id)
+
 
 def is_a_content(user_id):
-    return user_id == A_CONTENT_ID
+    return user_id == A_CONTENT_ID and not is_admin(user_id)
+
+
+def is_staff(user_id):
+    return is_admin(user_id) or is_a_content(user_id)
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (TypeError, ValueError):
+        return None
+
+
+def reminder_due(created_at=None):
+    base = datetime.now(timezone.utc)
+    if created_at:
+        parsed = parse_iso(created_at)
+        if parsed:
+            base = parsed
+    return (base + timedelta(hours=REMINDER_AFTER_HOURS)).isoformat()
+
+
+def next_reminder_after_now():
+    return (datetime.now(timezone.utc) + timedelta(hours=REMINDER_AFTER_HOURS)).isoformat()
+
+
+def display_amount(value):
+    return int(value) * AMOUNT_MULTIPLIER
+
 
 def available_amount(target):
     return max(
@@ -299,6 +436,39 @@ def user_menu():
     ])
 
 
+def a_content_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💰 دریافت حساب",
+                callback_data="u_get",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 درخواست‌های من",
+                callback_data="u_requests",
+            ),
+            InlineKeyboardButton(
+                "🧾 ارسال فیش",
+                callback_data="u_receipt",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🧾 فیش‌های دریافتی",
+                callback_data="c_receipts",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "ℹ️ راهنما",
+                callback_data="u_help",
+            ),
+        ],
+    ])
+
+
 def admin_menu():
     return InlineKeyboardMarkup([
         [
@@ -313,21 +483,14 @@ def admin_menu():
                 callback_data="a_status",
             ),
             InlineKeyboardButton(
-                "⏳ در انتظار",
+                "⏳ در انتظار واریز",
+                callback_data="a_payment_pending",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🧾 فیش‌های در انتظار تایید",
                 callback_data="a_pending",
-            ),
-        ],
-        [
-        InlineKeyboardButton("🗑 پاک کردن کل تاریخچه", callback_data="a_clear_history"),
-        ],
-        [
-            InlineKeyboardButton(
-                "🔎 جستجوی درخواست",
-                callback_data="a_search",
-            ),
-            InlineKeyboardButton(
-                "📈 گزارش درخواست‌ها",
-                callback_data="a_report",
             ),
         ],
         [
@@ -344,20 +507,6 @@ def admin_menu():
         ],
     ])
 
-def a_content_menu():
-    keyboard = user_menu().inline_keyboard.copy()
-
-    keyboard.insert(
-        2,
-        [
-            InlineKeyboardButton(
-                "🧾 فیش‌های دریافتی",
-                callback_data="c_receipts",
-            ),
-        ],
-    )
-
-    return InlineKeyboardMarkup(keyboard)
 
 def back_button():
     return InlineKeyboardMarkup([
@@ -369,76 +518,6 @@ def back_button():
         ],
     ])
 
-##
-##
-##
-
-async def admin_clear_history_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(update.effective_user.id):
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton("❌ لغو", callback_data="a_clear_cancel"),
-            InlineKeyboardButton("⚠️ بله، همه را پاک کن", callback_data="a_clear_confirm"),
-        ]
-    ]
-
-    await query.edit_message_text(
-        "⚠️ <b>هشدار خیلی مهم</b>\n\n"
-        "با تأیید این گزینه:\n\n"
-        "🗑 تمام درخواست‌ها حذف می‌شوند.\n"
-        "🗑 تمام حساب‌های پرداخت حذف می‌شوند.\n"
-        "🗑 تاریخچه درخواست‌ها از بین می‌رود.\n\n"
-        "❗ این عملیات قابل برگشت نیست.\n\n"
-        "آیا مطمئنی؟",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def admin_clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(update.effective_user.id):
-        return
-
-    conn = db()
-
-    try:
-        # پاک کردن تمام درخواست‌ها
-        conn.execute("DELETE FROM requests")
-
-        # پاک کردن تمام حساب‌ها
-        conn.execute("DELETE FROM payment_targets")
-
-        conn.commit()
-
-        await query.edit_message_text(
-            "✅ <b>تاریخچه با موفقیت پاک شد.</b>\n\n"
-            "🗑 تمام درخواست‌ها حذف شدند.\n"
-            "🗑 تمام حساب‌ها حذف شدند.\n"
-            "🧹 دیتای عملیاتی بات پاک‌سازی شد.",
-            parse_mode="HTML",
-            reply_markup=back_button()
-        )
-
-    except Exception as e:
-        conn.rollback()
-
-        await query.edit_message_text(
-            f"❌ خطا هنگام پاک کردن تاریخچه:\n\n"
-            f"<code>{e}</code>",
-            parse_mode="HTML",
-            reply_markup=back_button()
-        )
-
-    finally:
-        conn.close()
 
 # =========================================================
 # USER REQUEST STATUS MENU
@@ -458,11 +537,23 @@ def requests_status_menu():
         ],
         [
             InlineKeyboardButton(
+                "⚫ لغو شده ها",
+                callback_data="ur_cancelled",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 "⏳ در انتظار حساب",
                 callback_data="ur_waiting",
             ),
             InlineKeyboardButton(
-                "🟡 در انتظار تایید",
+                "💳 در انتظار واریز",
+                callback_data="ur_payment_pending",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🧾 در انتظار تایید فیش",
                 callback_data="ur_reserved",
             ),
         ],
@@ -489,11 +580,23 @@ def requests_status_keyboard():
         ],
         [
             InlineKeyboardButton(
+                "⚫ لغو شده ها",
+                callback_data="ur_cancelled",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 "⏳ در انتظار حساب",
                 callback_data="ur_waiting",
             ),
             InlineKeyboardButton(
-                "🟡 در انتظار تایید",
+                "💳 در انتظار واریز",
+                callback_data="ur_payment_pending",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🧾 در انتظار تایید فیش",
                 callback_data="ur_reserved",
             ),
         ],
@@ -567,6 +670,63 @@ async def show_main_menu(
 
 
 # =========================================================
+# /ADPASS - PROMOTE USER TO ADMIN
+# =========================================================
+
+async def command_adpass(update, context):
+    user = update.effective_user
+
+    # این مسیر فقط برای کاربر عادی است و هیچ دکمه‌ای برای آن وجود ندارد.
+    if is_staff(user.id):
+        await update.message.reply_text(
+            "ℹ️ شما در حال حاضر دسترسی مدیریتی دارید."
+        )
+        return
+
+    if not ADPASS_PASSWORD:
+        logger.error("ADPASS_PASSWORD is not configured")
+        await update.message.reply_text(
+            "❌ قابلیت ارتقای ادمین در حال حاضر تنظیم نشده است."
+        )
+        return
+
+    clear_state(context)
+    context.user_data["adpass_password"] = True
+
+    await update.message.reply_text(
+        "🔐 لطفاً رمز عبور مدیریت را وارد کنید:\n\n"
+        "⚠️ رمز را فقط در همین گفت‌وگو ارسال کنید."
+    )
+
+
+async def receive_adpass_password(update, context):
+    if not context.user_data.get("adpass_password"):
+        return False
+
+    password = (update.message.text or "").strip()
+    context.user_data.pop("adpass_password", None)
+
+    if not ADPASS_PASSWORD or password != ADPASS_PASSWORD:
+        await update.message.reply_text(
+            "❌ رمز عبور اشتباه است. دسترسی مدیریت فعال نشد."
+        )
+        return True
+
+    user_id = update.effective_user.id
+    promote_to_admin(user_id)
+
+    await update.message.reply_text(
+        "✅ رمز صحیح است.\n\n"
+        "🔐 دسترسی ادمین برای حساب شما فعال شد.\n"
+        "از این به بعد منوی مدیریت را مشاهده خواهید کرد."
+    )
+
+    # منوی مدیریت را بلافاصله نمایش بده.
+    await show_main_menu(update, context, edit=False)
+    return True
+
+
+# =========================================================
 # START
 # =========================================================
 
@@ -576,108 +736,6 @@ async def start(update, context):
         context,
         edit=False,
     )
-
-
-# =========================================================
-# SMART REQUEST QUEUE
-# =========================================================
-
-def assign_waiting_requests(conn, target_id=None):
-    """اختصاص هوشمند درخواست‌های waiting بدون قفل شدن صف."""
-    assigned = []
-
-    sql = """
-        SELECT *
-        FROM payment_targets
-        WHERE active = 1
-    """
-    params = ()
-
-    if target_id is not None:
-        sql += " AND id = ?"
-        params = (target_id,)
-
-    sql += " ORDER BY id ASC"
-
-    for target in conn.execute(sql, params).fetchall():
-        available = available_amount(target)
-
-        while available > 0:
-            # اگر درخواست اول جا نشود، درخواست‌های کوچک‌تر بررسی می‌شوند.
-            request = conn.execute("""
-                SELECT *
-                FROM requests
-                WHERE status = 'waiting'
-                  AND amount <= ?
-                ORDER BY id ASC
-                LIMIT 1
-            """, (available,)).fetchone()
-
-            if not request:
-                break
-
-            result = conn.execute("""
-                UPDATE requests
-                SET target_id = ?,
-                    status = 'reserved',
-                    updated_at = ?
-                WHERE id = ?
-                  AND status = 'waiting'
-            """, (target["id"], now_iso(), request["id"]))
-
-            if result.rowcount != 1:
-                continue
-
-            conn.execute("""
-                UPDATE payment_targets
-                SET reserved_amount = reserved_amount + ?
-                WHERE id = ?
-            """, (request["amount"], target["id"]))
-
-            assigned.append({
-                "request_id": request["id"],
-                "user_id": request["user_id"],
-                "amount": request["amount"],
-                "target_id": target["id"],
-                "owner_name": target["owner_name"],
-                "account_number": target["account_number"],
-            })
-
-            available -= int(request["amount"])
-
-    return assigned
-
-
-async def notify_assigned_requests(bot, assigned):
-    for item in assigned:
-        try:
-            await bot.send_message(
-                item["user_id"],
-                "🎉 *حساب برای شما آماده شد!*\n\n"
-                f"🆔 درخواست: `{item['request_id']}`\n"
-                f"👤 صاحب حساب: `{item['owner_name']}`\n"
-                f"🏦 شماره حساب:\n`{item['account_number']}`\n\n"
-                f"💰 مبلغ: `{fmt_amount(item['amount'])}` تومان\n\n"
-                "درخواست شما طبق نوبت هوشمند به این حساب اختصاص یافت.\n"
-                "پس از پرداخت، فیش را ارسال کنید.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "🧾 ارسال فیش",
-                            callback_data=f"r_{item['request_id']}",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "📋 درخواست‌های من",
-                            callback_data="u_requests",
-                        ),
-                    ],
-                ]),
-            )
-        except Exception:
-            pass
 
 
 # =========================================================
@@ -695,9 +753,9 @@ async def get_account_menu(update, context):
 
     await query.edit_message_text(
         "💰 *دریافت حساب*\n\n"
-        "مبلغ مورد نظر را به ميليون تومان وارد کنيد.\n\n"
+        "مبلغ موردنظر را به تومان وارد کنید.\n\n"
         "مثال:\n"
-        "`50000000`",
+        "`11.5`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
     )
@@ -715,7 +773,7 @@ async def receive_amount(update, context):
         await update.message.reply_text(
             "❌ مبلغ نامعتبر است.\n\n"
             "مثال:\n"
-            "`50000000`",
+            "`11.5`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -725,10 +783,44 @@ async def receive_amount(update, context):
         None,
     )
 
+    # بعد از مبلغ، نام صاحب رزرو را می‌گیریم.
+    context.user_data["pending_amount"] = amount
+    context.user_data["reservation_name"] = True
+
+    await update.message.reply_text(
+        "👤 لطفاً *نام و نام خانوادگی* خود را برای ثبت رزرو وارد کنید:\n\n"
+        "مثال: `علی رضایی`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_button(),
+    )
+
+
+async def receive_reservation_name(update, context):
+    if not context.user_data.get("reservation_name"):
+        return
+
+    name = (update.message.text or "").strip()
+    if len(name) < 2 or len(name) > 100:
+        await update.message.reply_text(
+            "❌ نام واردشده معتبر نیست. لطفاً نام و نام خانوادگی را وارد کنید."
+        )
+        return
+
+    amount = context.user_data.pop("pending_amount", None)
+    context.user_data.pop("reservation_name", None)
+
+    if amount is None:
+        await update.message.reply_text(
+            "❌ اطلاعات مبلغ پیدا نشد. لطفاً دوباره از گزینه «دریافت حساب» شروع کنید.",
+            reply_markup=user_menu(),
+        )
+        return
+
     await create_request(
         update,
         context,
         amount,
+        reservation_name=name,
     )
 
 
@@ -736,61 +828,100 @@ async def create_request(
     update,
     context,
     amount,
+    reservation_name=None,
 ):
     user = update.effective_user
+
     conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+
+    targets = conn.execute("""
+        SELECT *
+        FROM payment_targets
+        WHERE active = 1
+        AND (
+            capacity
+            - reserved_amount
+            - paid_amount
+        ) >= ?
+        ORDER BY id ASC
+        LIMIT 1
+    """, (
+        amount,
+    )).fetchone()
+
     created = now_iso()
 
-    cursor = conn.execute("""
-        INSERT INTO requests (
-            user_id, username, first_name, amount,
-            status, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, 'waiting', ?, ?)
-    """, (
-        user.id,
-        user.username,
-        user.first_name,
-        amount,
-        created,
-        created,
-    ))
+    # -----------------------------------------------------
+    # ACCOUNT FOUND
+    # -----------------------------------------------------
 
-    request_id = cursor.lastrowid
+    if targets:
 
-    # تمام درخواست‌های waiting را دوباره بررسی می‌کنیم.
-    # انتخاب، قدیمی‌ترین درخواستِ قابل انجام است؛
-    # بنابراین یک درخواست ۵۰۰۰ تومانی جلوی درخواست ۱۰۰۰ تومانی را نمی‌گیرد.
-    assigned = assign_waiting_requests(conn)
-    conn.commit()
+        cursor = conn.execute("""
+            INSERT INTO requests (
+                user_id,
+                username,
+                first_name,
+                reservation_name,
+                account_number_snapshot,
+                amount,
+                target_id,
+                status,
+                created_at,
+                updated_at,
+                next_reminder_at
+            )
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?
+            )
+        """, (
+            user.id,
+            user.username,
+            user.first_name,
+            reservation_name,
+            targets["account_number"],
+            amount,
+            targets["id"],
+            created,
+            created,
+            reminder_due(created),
+        ))
 
-    current = next(
-        (x for x in assigned if x["request_id"] == request_id),
-        None,
-    )
+        request_id = cursor.lastrowid
 
-    if current:
-        target = conn.execute("""
-            SELECT capacity, reserved_amount, paid_amount
-            FROM payment_targets
+        conn.execute("""
+            UPDATE payment_targets
+            SET reserved_amount =
+                reserved_amount + ?
             WHERE id = ?
-        """, (current["target_id"],)).fetchone()
+        """, (
+            amount,
+            targets["id"],
+        ))
 
-        remaining = max(
-            0,
-            int(target["capacity"])
-            - int(target["reserved_amount"])
-            - int(target["paid_amount"]),
+        conn.commit()
+
+        remaining = (
+            int(targets["capacity"])
+            - int(targets["reserved_amount"])
+            - int(targets["paid_amount"])
+            - amount
         )
+
         conn.close()
 
         await update.message.reply_text(
             "✅ *حساب برای شما اختصاص داده شد*\n\n"
             f"🆔 درخواست: `{request_id}`\n\n"
-            f"👤 صاحب حساب:\n`{current['owner_name']}`\n\n"
-            f"🏦 شماره حساب:\n`{current['account_number']}`\n\n"
-            f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n"
-            f"📊 باقی‌مانده: `{fmt_amount(remaining)}` تومان\n\n"
+            f"👤 صاحب حساب:\n"
+            f"`{targets['owner_name']}`\n\n"
+            f"🏦 شماره حساب:\n"
+            f"`{targets['account_number']}`\n\n"
+            f"💰 مبلغ:\n"
+            f"`{fmt_amount(amount)}` تومان\n\n"
+            f"📊 باقی‌مانده:\n"
+            f"`{fmt_amount(max(0, remaining))}` تومان\n\n"
             "پس از پرداخت، فیش را ارسال کنید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
@@ -815,44 +946,80 @@ async def create_request(
             ]),
         )
 
-        others = [
-            x for x in assigned
-            if x["request_id"] != request_id
-        ]
-        await notify_assigned_requests(context.bot, others)
         return
+
+    # -----------------------------------------------------
+    # WAITING
+    # -----------------------------------------------------
+
+    cursor = conn.execute("""
+        INSERT INTO requests (
+            user_id,
+            username,
+            first_name,
+            reservation_name,
+            account_number_snapshot,
+            amount,
+            status,
+            created_at,
+            updated_at,
+            next_reminder_at
+        )
+        VALUES (
+            ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, NULL
+        )
+    """, (
+        user.id,
+        user.username,
+        user.first_name,
+        reservation_name,
+        None,
+        amount,
+        created,
+        created,
+    ))
+
+    request_id = cursor.lastrowid
 
     max_available = conn.execute("""
         SELECT COALESCE(
-            MAX(capacity - reserved_amount - paid_amount), 0
-        ) AS max_available
+            MAX(
+                capacity
+                - reserved_amount
+                - paid_amount
+            ),
+            0
+        )
+        AS max_available
         FROM payment_targets
         WHERE active = 1
     """).fetchone()["max_available"]
 
+    conn.commit()
     conn.close()
 
     await update.message.reply_text(
         "⏳ *درخواست شما در صف انتظار قرار گرفت*\n\n"
         f"🆔 درخواست: `{request_id}`\n"
         f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\n"
-        "فعلاً حساب مناسبی برای این مبلغ وجود ندارد.\n\n"
-        f"📊 بیشترین ظرفیت فعلی: `{fmt_amount(max_available)}` تومان\n\n"
-        "🧠 درخواست شما وارد صف هوشمند شد. اگر درخواست بزرگ‌تری "
-        "قابل انجام نباشد، درخواست‌های کوچک‌تر متوقف نمی‌شوند.\n\n"
-        "🔔 به محض پیدا شدن حساب مناسب، مشخصات حساب برای شما ارسال می‌شود.",
+        "در حال حاضر حساب مناسبی وجود ندارد.\n\n"
+        f"📊 بیشترین ظرفیت فعلی:\n"
+        f"`{fmt_amount(max_available)}` تومان\n\n"
+        "🔔 با اضافه شدن حساب مناسب، "
+        "درخواست شما خودکار اختصاص داده می‌شود.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
     )
 
+    # اطلاع ادمین‌ها
     admin_text = (
         "🚨 *درخواست جدید*\n\n"
         f"🆔 `{request_id}`\n"
-        f"👤 {user.first_name or '-'}\n"
+        f"👤 نام رزرو: {reservation_name or '-'}\n"
         f"🔹 @{user.username or '-'}\n"
         f"🔢 `{user.id}`\n"
         f"💰 `{fmt_amount(amount)}` تومان\n\n"
-        "⚠️ هنوز حساب مناسبی اختصاص نیافته است."
+        "⚠️ حساب مناسب موجود نیست."
     )
 
     for admin_id in ADMIN_IDS:
@@ -898,29 +1065,44 @@ async def my_requests_by_status(
 
     status_names = {
         "waiting": "⏳ در انتظار حساب",
-        "reserved": "🟡 در انتظار تایید",
+        "reserved": "🧾 در انتظار تایید فیش",
+        "payment_pending": "💳 در انتظار واریز",
         "paid": "🟢 تایید شده ها",
         "rejected": "🔴 رد شده ها",
+        "cancelled": "⚫ لغو شده ها",
     }
 
     conn = db()
 
-    rows = conn.execute("""
-        SELECT
-            id,
-            amount,
-            status,
-            receipt_file_id,
-            created_at
-        FROM requests
-        WHERE user_id = ?
-        AND status = ?
-        ORDER BY id DESC
-        LIMIT 20
-    """, (
-        user_id,
-        status,
-    )).fetchall()
+    if status == "payment_pending":
+        rows = conn.execute("""
+            SELECT id, amount, status, receipt_file_id, created_at
+            FROM requests
+            WHERE user_id = ?
+              AND status = 'reserved'
+              AND receipt_file_id IS NULL
+            ORDER BY id DESC
+            LIMIT 20
+        """, (user_id,)).fetchall()
+    elif status == "reserved":
+        rows = conn.execute("""
+            SELECT id, amount, status, receipt_file_id, created_at
+            FROM requests
+            WHERE user_id = ?
+              AND status = 'reserved'
+              AND receipt_file_id IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 20
+        """, (user_id,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT id, amount, status, receipt_file_id, created_at
+            FROM requests
+            WHERE user_id = ?
+              AND status = ?
+            ORDER BY id DESC
+            LIMIT 20
+        """, (user_id, status)).fetchall()
 
     conn.close()
 
@@ -1022,7 +1204,7 @@ async def receive_receipt_id(
     conn = db()
 
     request = conn.execute("""
-        SELECT id, status
+        SELECT id, status, receipt_file_id
         FROM requests
         WHERE id = ?
         AND user_id = ?
@@ -1039,9 +1221,9 @@ async def receive_receipt_id(
         )
         return
 
-    if request["status"] != "reserved":
+    if request["status"] != "reserved" or request["receipt_file_id"]:
         await update.message.reply_text(
-            "❌ این درخواست در وضعیت ارسال فیش نیست."
+            "❌ این درخواست در وضعیت ارسال فیش نیست یا فیش آن قبلاً ارسال شده است."
         )
         return
 
@@ -1099,11 +1281,20 @@ async def receive_receipt(
         conn.close()
         return
 
+    if request["status"] != "reserved" or request["receipt_file_id"]:
+        conn.close()
+        context.user_data.pop("receipt_request", None)
+        await update.message.reply_text(
+            "❌ این درخواست دیگر آماده دریافت فیش نیست."
+        )
+        return
+
     conn.execute("""
         UPDATE requests
         SET receipt_file_id = ?,
             receipt_type = ?,
-            updated_at = ?
+            updated_at = ?,
+            next_reminder_at = NULL
         WHERE id = ?
     """, (
         file_id,
@@ -1123,7 +1314,7 @@ async def receive_receipt(
     await update.message.reply_text(
         "✅ *فیش دریافت شد.*\n\n"
         f"🆔 درخواست: `{request_id}`\n\n"
-        "⏳ برای ادمین ارسال شد.",
+        "⏳ برای بررسی ارسال شد.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=user_menu(),
     )
@@ -1144,7 +1335,7 @@ async def receive_receipt(
     admin_text = (
         "🧾 *فیش جدید*\n\n"
         f"🆔 درخواست: `{request_id}`\n"
-        f"👤 {user.first_name or '-'}\n"
+        f"👤 نام رزرو: {request['reservation_name'] or request['first_name'] or '-'}\n"
         f"🔹 @{user.username or '-'}\n"
         f"💰 `{fmt_amount(request['amount'])}` تومان"
     )
@@ -1174,93 +1365,93 @@ async def receive_receipt(
         except Exception:
             pass
 
+    # A Content هم همان فیش را دریافت می‌کند.
+    if not is_admin(A_CONTENT_ID):
+        try:
+            await context.bot.send_message(
+                A_CONTENT_ID,
+                admin_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+            )
+            if receipt_type == "photo":
+                await context.bot.send_photo(
+                    A_CONTENT_ID,
+                    file_id,
+                    caption=f"🧾 فیش #{request_id}",
+                )
+            else:
+                await context.bot.send_document(
+                    A_CONTENT_ID,
+                    file_id,
+                    caption=f"🧾 فیش #{request_id}",
+                )
+        except Exception:
+            pass
+
 
 # =========================================================
-# APPROVE
+# A CONTENT - RECEIPTS
 # =========================================================
+
 async def a_content_receipts(update, context):
     query = update.callback_query
-
     await query.answer()
 
     if not is_a_content(query.from_user.id):
         return
 
     conn = db()
-
     rows = conn.execute("""
-        SELECT
-            id,
-            user_id,
-            username,
-            first_name,
-            amount
+        SELECT id, amount, user_id, username, first_name
         FROM requests
         WHERE status = 'reserved'
-        AND receipt_file_id IS NOT NULL
+          AND receipt_file_id IS NOT NULL
         ORDER BY id ASC
         LIMIT 50
     """).fetchall()
-
     conn.close()
 
     if not rows:
         await query.edit_message_text(
             "🧾 *فیش‌های دریافتی*\n\n"
-            "در حال حاضر فیشی برای بررسی وجود ندارد.",
+            "فعلاً فیشی برای بررسی وجود ندارد.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_button(),
         )
         return
 
     keyboard = []
-
     for row in rows:
         keyboard.append([
             InlineKeyboardButton(
                 f"🧾 #{row['id']} | {fmt_amount(row['amount'])}",
                 callback_data=f"c_receipt_{row['id']}",
-            ),
+            )
         ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "⬅️ بازگشت",
-            callback_data="main",
-        ),
-    ])
+    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
 
     await query.edit_message_text(
-        "🧾 *فیش‌های دریافتی*\n\n"
-        "یک فیش را برای بررسی انتخاب کنید:",
+        "🧾 *فیش‌های دریافتی*\n\nیک فیش را برای بررسی انتخاب کنید:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-async def a_content_receipt_item(
-    update,
-    context,
-    request_id,
-):
-    query = update.callback_query
 
+async def a_content_receipt_item(update, context, request_id):
+    query = update.callback_query
     await query.answer()
 
     if not is_a_content(query.from_user.id):
         return
 
     conn = db()
-
     row = conn.execute("""
-        SELECT *
-        FROM requests
+        SELECT * FROM requests
         WHERE id = ?
-        AND status = 'reserved'
-        AND receipt_file_id IS NOT NULL
-    """, (
-        request_id,
-    )).fetchone()
-
+          AND status = 'reserved'
+          AND receipt_file_id IS NOT NULL
+    """, (request_id,)).fetchone()
     conn.close()
 
     if not row:
@@ -1272,65 +1463,52 @@ async def a_content_receipt_item(
 
     text = (
         "🧾 *بررسی فیش*\n\n"
-        f"🆔 درخواست: `{row['id']}`\n"
-        f"👤 {row['first_name'] or '-'}\n"
+        f"🆔 `{row['id']}`\n"
+        f"👤 نام رزرو: {row['reservation_name'] or row['first_name'] or '-'}\n"
         f"🔹 @{row['username'] or '-'}\n"
         f"🔢 `{row['user_id']}`\n"
-        f"💰 `{fmt_amount(row['amount'])}` تومان\n\n"
-        "فیش را بررسی کنید:"
+        f"💰 `{fmt_amount(row['amount'])}` تومان"
     )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ تأیید",
-                callback_data=f"ok_{request_id}",
-            ),
-            InlineKeyboardButton(
-                "❌ رد",
-                callback_data=f"no_{request_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ برگشت",
-                callback_data="c_receipts",
-            ),
-        ],
-    ])
 
     await query.edit_message_text(
         text,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ تأیید", callback_data=f"ok_{request_id}"),
+                InlineKeyboardButton("❌ رد", callback_data=f"no_{request_id}"),
+            ],
+            [InlineKeyboardButton("⬅️ برگشت", callback_data="c_receipts")],
+        ]),
     )
 
-    # ارسال خود فایل فیش برای A Content
     try:
-        if row["receipt_type"] == "photo":
+        if row['receipt_type'] == 'photo':
             await context.bot.send_photo(
                 query.from_user.id,
-                row["receipt_file_id"],
+                row['receipt_file_id'],
                 caption=f"🧾 فیش درخواست #{request_id}",
             )
         else:
             await context.bot.send_document(
                 query.from_user.id,
-                row["receipt_file_id"],
+                row['receipt_file_id'],
                 caption=f"🧾 فیش درخواست #{request_id}",
             )
     except Exception:
         pass
-    
+
+
+# =========================================================
+# APPROVE
+# =========================================================
+
 async def approve(update, context, request_id):
     query = update.callback_query
 
     await query.answer("✅ تأیید شد")
 
-    if not (
-        is_admin(query.from_user.id)
-        or is_a_content(query.from_user.id)
-    ):
+    if not is_staff(query.from_user.id):
         return
 
     conn = db()
@@ -1339,6 +1517,8 @@ async def approve(update, context, request_id):
         SELECT *
         FROM requests
         WHERE id = ?
+          AND status = 'reserved'
+          AND receipt_file_id IS NOT NULL
     """, (
         request_id,
     )).fetchone()
@@ -1354,8 +1534,11 @@ async def approve(update, context, request_id):
     conn.execute("""
         UPDATE requests
         SET status = 'paid',
-            updated_at = ?
+            updated_at = ?,
+            next_reminder_at = NULL
         WHERE id = ?
+          AND status = 'reserved'
+          AND receipt_file_id IS NOT NULL
     """, (
         now_iso(),
         request_id,
@@ -1411,10 +1594,7 @@ async def reject(update, context, request_id):
 
     await query.answer("❌ رد شد")
 
-    if not (
-        is_admin(query.from_user.id)
-        or is_a_content(query.from_user.id)
-    ):
+    if not is_staff(query.from_user.id):
         return
 
     conn = db()
@@ -1423,6 +1603,8 @@ async def reject(update, context, request_id):
         SELECT *
         FROM requests
         WHERE id = ?
+          AND status = 'reserved'
+          AND receipt_file_id IS NOT NULL
     """, (
         request_id,
     )).fetchone()
@@ -1438,7 +1620,8 @@ async def reject(update, context, request_id):
     conn.execute("""
         UPDATE requests
         SET status = 'rejected',
-            updated_at = ?
+            updated_at = ?,
+            next_reminder_at = NULL
         WHERE id = ?
     """, (
         now_iso(),
@@ -1459,17 +1642,8 @@ async def reject(update, context, request_id):
             request["target_id"],
         ))
 
-    # با آزاد شدن ظرفیت، صف هوشمند دوباره اجرا می‌شود.
-    assigned = []
-    if request["target_id"]:
-        assigned = assign_waiting_requests(
-            conn,
-            target_id=request["target_id"],
-        )
-
     conn.commit()
     conn.close()
-
 
     try:
         await query.edit_message_reply_markup(
@@ -1490,8 +1664,6 @@ async def reject(update, context, request_id):
     except Exception:
         pass
 
-    await notify_assigned_requests(context.bot, assigned)
-
 
 # =========================================================
 # ADMIN STATUS
@@ -1506,7 +1678,6 @@ async def admin_status(update, context):
         return
 
     conn = db()
-
     rows = conn.execute("""
         SELECT
             id,
@@ -1519,46 +1690,474 @@ async def admin_status(update, context):
         FROM payment_targets
         ORDER BY id ASC
     """).fetchall()
-
     conn.close()
 
     if not rows:
-        text = (
-            "📊 *وضعیت حساب‌ها*\n\n"
-            "هیچ حسابی وجود ندارد."
+        await query.edit_message_text(
+            "📊 *وضعیت حساب‌ها*\n\nهیچ حسابی وجود ندارد.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
+        return
+
+    parts = ["📊 *وضعیت حساب‌ها*\n"]
+    keyboard = []
+
+    for row in rows:
+        remaining = available_amount(row)
+        status = "🟢 فعال" if row["active"] else "🔴 حذف/غیرفعال"
+
+        parts.append(
+            f"🆔 `{row['id']}` | {status}\n"
+            f"👤 {row['owner_name']}\n"
+            f"🏦 `{row['account_number']}`\n"
+            f"💳 سقف: `{fmt_amount(row['capacity'])}`\n"
+            f"🟡 رزرو: `{fmt_amount(row['reserved_amount'])}`\n"
+            f"🟢 پرداخت: `{fmt_amount(row['paid_amount'])}`\n"
+            f"📊 باقی: `{fmt_amount(remaining)}`\n"
+            "━━━━━━━━━━━━━━"
         )
 
+        keyboard.append([
+            InlineKeyboardButton(
+                f"👥 رزروهای حساب #{row['id']}",
+                callback_data=f"a_target_reservations_{row['id']}",
+            )
+        ])
+        if row["active"]:
+            keyboard.append([
+                InlineKeyboardButton(
+                    "✏️ تغییر شماره حساب",
+                    callback_data=f"a_target_edit_{row['id']}",
+                ),
+                InlineKeyboardButton(
+                    "🗑 حذف حساب",
+                    callback_data=f"a_target_delete_{row['id']}",
+                ),
+            ])
+
+    keyboard.append([
+        InlineKeyboardButton("⬅️ بازگشت", callback_data="main")
+    ])
+
+    await query.edit_message_text(
+        "\n".join(parts),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# =========================================================
+# ADMIN ACCOUNT MANAGEMENT
+# =========================================================
+
+async def admin_target_reservations(update, context, target_id):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
+    target = conn.execute(
+        "SELECT * FROM payment_targets WHERE id = ?", (target_id,)
+    ).fetchone()
+    rows = conn.execute("""
+        SELECT id, user_id, username, first_name, reservation_name,
+               account_number_snapshot, amount, status, receipt_file_id, created_at
+        FROM requests
+        WHERE target_id = ?
+          AND status IN ('reserved', 'paid', 'rejected')
+        ORDER BY id DESC
+        LIMIT 100
+    """, (target_id,)).fetchall()
+    conn.close()
+
+    if not target:
+        await query.edit_message_text("❌ حساب پیدا نشد.", reply_markup=back_button())
+        return
+
+    if not rows:
+        text = (
+            "👥 *رزروهای این حساب*\n\n"
+            f"🏦 `{target['account_number']}`\n"
+            "هیچ رزروی برای این حساب ثبت نشده است."
+        )
     else:
         parts = [
-            "📊 *وضعیت حساب‌ها*\n"
+            "👥 *رزروهای این حساب*\n",
+            f"🆔 حساب: `{target['id']}`",
+            f"🏦 `{target['account_number']}`\n",
         ]
-
+        status_names = {
+            "reserved": "🟡 رزرو شده",
+            "paid": "🟢 پرداخت شده",
+            "rejected": "🔴 رد شده",
+        }
         for row in rows:
-            remaining = available_amount(row)
-
-            status = (
-                "🟢 فعال"
-                if row["active"]
-                else "🔴 بسته"
-            )
-
+            name = row["reservation_name"] or row["first_name"] or "-"
+            username = f"@{row['username']}" if row["username"] else "-"
+            receipt = "🧾 فیش ارسال شده" if row["receipt_file_id"] else "⚠️ بدون فیش"
             parts.append(
-                f"🆔 `{row['id']}` | {status}\n"
-                f"👤 {row['owner_name']}\n"
-                f"🏦 `{row['account_number']}`\n"
-                f"💳 سقف: `{fmt_amount(row['capacity'])}`\n"
-                f"🟡 رزرو: `{fmt_amount(row['reserved_amount'])}`\n"
-                f"🟢 پرداخت: `{fmt_amount(row['paid_amount'])}`\n"
-                f"📊 باقی: `{fmt_amount(remaining)}`\n"
+                f"🆔 درخواست: `{row['id']}`\n"
+                f"👤 نام رزرو: {name}\n"
+                f"🔹 یوزرنیم: {username}\n"
+                f"🔢 User ID: `{row['user_id']}`\n"
+                f"🏦 شماره هنگام رزرو: `{row['account_number_snapshot'] or target['account_number']}`\n"
+                f"💰 مبلغ رزرو: `{fmt_amount(row['amount'])}` تومان\n"
+                f"📌 وضعیت: {status_names.get(row['status'], row['status'])}\n"
+                f"{receipt}\n"
                 "━━━━━━━━━━━━━━"
             )
-
         text = "\n".join(parts)
 
     await query.edit_message_text(
         text,
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
+        ]),
+    )
+
+
+async def admin_edit_target_start(update, context, target_id):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
+    target = conn.execute(
+        "SELECT id, account_number FROM payment_targets WHERE id = ? AND active = 1",
+        (target_id,),
+    ).fetchone()
+    conn.close()
+
+    if not target:
+        await query.edit_message_text(
+            "❌ این حساب پیدا نشد یا قبلاً حذف شده است.",
+            reply_markup=back_button(),
+        )
+        return
+
+    clear_state(context)
+    context.user_data["edit_target_id"] = target_id
+
+    await query.edit_message_text(
+        "✏️ *تغییر شماره حساب*\n\n"
+        f"🆔 حساب: `{target['id']}`\n"
+        f"🏦 شماره فعلی: `{target['account_number']}`\n\n"
+        "شماره حساب جدید را ارسال کنید:",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
+    )
+
+
+async def process_edit_target(update, context):
+    target_id = context.user_data.get("edit_target_id")
+    if not target_id:
+        return
+
+    if not is_admin(update.effective_user.id):
+        clear_state(context)
+        return
+
+    new_account = (update.message.text or "").strip()
+    if not new_account or len(new_account) < 4 or len(new_account) > 100:
+        await update.message.reply_text("❌ شماره حساب نامعتبر است. دوباره وارد کنید.")
+        return
+
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    target = conn.execute(
+        "SELECT * FROM payment_targets WHERE id = ? AND active = 1", (target_id,)
+    ).fetchone()
+    if not target:
+        conn.rollback()
+        conn.close()
+        clear_state(context)
+        await update.message.reply_text("❌ حساب پیدا نشد یا غیرفعال شده است.", reply_markup=admin_menu())
+        return
+
+    old_account = target["account_number"]
+    if new_account == old_account:
+        conn.rollback()
+        conn.close()
+        clear_state(context)
+        await update.message.reply_text("ℹ️ شماره حساب تغییری نکرد.", reply_markup=admin_menu())
+        return
+
+    conn.execute(
+        "UPDATE payment_targets SET account_number = ? WHERE id = ?",
+        (new_account, target_id),
+    )
+
+    affected = conn.execute("""
+        SELECT id, user_id, amount, reservation_name, receipt_file_id
+        FROM requests
+        WHERE target_id = ?
+          AND status = 'reserved'
+    """, (target_id,)).fetchall()
+
+    conn.commit()
+    conn.close()
+    clear_state(context)
+
+    await update.message.reply_text(
+        "✅ *شماره حساب تغییر کرد*\n\n"
+        f"🆔 حساب: `{target_id}`\n"
+        f"🏦 قبلی: `{old_account}`\n"
+        f"🏦 جدید: `{new_account}`\n\n"
+        f"📢 تعداد رزروهای فعال که اطلاع‌رسانی می‌شوند: `{len(affected)}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_menu(),
+    )
+
+    for row in affected:
+        try:
+            await context.bot.send_message(
+                row["user_id"],
+                "⚠️ *اطلاعیه تغییر شماره حساب*\n\n"
+                f"🆔 درخواست: `{row['id']}`\n"
+                f"💰 مبلغ رزرو: `{fmt_amount(row['amount'])}` تومان\n"
+                f"🏦 شماره حساب قبلی: `{old_account}`\n"
+                f"🏦 شماره حساب جدید: `{new_account}`\n\n"
+                "لطفاً برای این درخواست، شماره حساب جدید را ملاک قرار دهید.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+
+async def admin_delete_target(update, context, target_id):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
+    target = conn.execute(
+        "SELECT * FROM payment_targets WHERE id = ? AND active = 1", (target_id,)
+    ).fetchone()
+    if not target:
+        conn.close()
+        await query.edit_message_text("❌ حساب پیدا نشد یا قبلاً حذف شده است.", reply_markup=back_button())
+        return
+
+    pending_receipt = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM requests
+        WHERE target_id = ?
+          AND status = 'reserved'
+          AND receipt_file_id IS NOT NULL
+    """, (target_id,)).fetchone()["c"]
+    conn.close()
+
+    if pending_receipt:
+        await query.edit_message_text(
+            "⚠️ *حذف حساب انجام نشد*\n\n"
+            f"برای این حساب `{pending_receipt}` درخواست وجود دارد که فیش آن ارسال شده ولی هنوز بررسی نشده است.\n\n"
+            "ابتدا فیش‌های آن حساب را بررسی کنید، سپس حساب را حذف کنید.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧾 فیش‌های در انتظار تایید", callback_data="a_pending")],
+                [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status")],
+            ]),
+        )
+        return
+
+    await query.edit_message_text(
+        "⚠️ *تأیید حذف حساب*\n\n"
+        f"🆔 `{target['id']}`\n"
+        f"👤 {target['owner_name']}\n"
+        f"🏦 `{target['account_number']}`\n\n"
+        "با حذف حساب، رزروهای بدون فیش آزاد و دوباره در صف انتظار قرار می‌گیرند و به کاربران اطلاع داده می‌شود.\n\n"
+        "تاریخچه درخواست‌ها حذف نمی‌شود.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 بله، حذف شود", callback_data=f"a_target_delete_confirm_{target_id}")],
+            [InlineKeyboardButton("❌ انصراف", callback_data="a_status")],
+        ]),
+    )
+
+
+async def admin_delete_target_confirm(update, context, target_id):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    target = conn.execute(
+        "SELECT * FROM payment_targets WHERE id = ? AND active = 1", (target_id,)
+    ).fetchone()
+    if not target:
+        conn.rollback()
+        conn.close()
+        await query.edit_message_text("❌ حساب پیدا نشد یا قبلاً حذف شده است.", reply_markup=back_button())
+        return
+
+    pending_receipt = conn.execute("""
+        SELECT COUNT(*) AS c FROM requests
+        WHERE target_id = ? AND status = 'reserved' AND receipt_file_id IS NOT NULL
+    """, (target_id,)).fetchone()["c"]
+    if pending_receipt:
+        conn.rollback()
+        conn.close()
+        await query.edit_message_text(
+            "❌ حذف متوقف شد؛ هنوز فیش بررسی‌نشده برای این حساب وجود دارد.",
+            reply_markup=back_button(),
+        )
+        return
+
+    affected = conn.execute("""
+        SELECT id, user_id, amount, reservation_name
+        FROM requests
+        WHERE target_id = ? AND status = 'reserved' AND receipt_file_id IS NULL
+    """, (target_id,)).fetchall()
+
+    now = now_iso()
+    for row in affected:
+        conn.execute("""
+            UPDATE requests
+            SET target_id = NULL,
+                status = 'waiting',
+                updated_at = ?,
+                next_reminder_at = NULL
+            WHERE id = ? AND status = 'reserved' AND receipt_file_id IS NULL
+        """, (now, row["id"]))
+
+    conn.execute(
+        "UPDATE payment_targets SET active = 0, reserved_amount = 0 WHERE id = ?",
+        (target_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    await query.edit_message_text(
+        "✅ *حساب حذف شد*\n\n"
+        f"🆔 `{target_id}`\n"
+        f"🏦 `{target['account_number']}`\n"
+        f"📢 رزروهای آزادشده: `{len(affected)}`\n\n"
+        "حساب از تخصیص‌های جدید خارج شد و تاریخچه آن حفظ شده است.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_menu(),
+    )
+
+    for row in affected:
+        try:
+            await context.bot.send_message(
+                row["user_id"],
+                "⚠️ *اطلاعیه حذف شماره حساب*\n\n"
+                f"🆔 درخواست: `{row['id']}`\n"
+                f"💰 مبلغ رزرو: `{fmt_amount(row['amount'])}` تومان\n\n"
+                "شماره حسابی که برای شما رزرو شده بود از دسترس خارج شده است.\n"
+                "درخواست شما لغو نشده و دوباره در صف انتظار قرار گرفت؛ به محض پیدا شدن حساب مناسب، شماره حساب جدید برای شما ارسال می‌شود.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=user_menu(),
+            )
+        except Exception:
+            pass
+
+
+# =========================================================
+# ADMIN PAYMENT PENDING (NO RECEIPT)
+# =========================================================
+
+async def admin_payment_pending(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT id, user_id, username, first_name, reservation_name, amount, created_at
+        FROM requests
+        WHERE status = 'reserved'
+          AND receipt_file_id IS NULL
+        ORDER BY id ASC
+        LIMIT 50
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        await query.edit_message_text(
+            "💳 *درخواست‌های در انتظار واریز*\n\n"
+            "هیچ درخواستی در انتظار واریز نیست.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
+        return
+
+    keyboard = []
+    for row in rows:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"💳 #{row['id']} | {row['reservation_name'] or row['first_name'] or '-'} | {fmt_amount(row['amount'])}",
+                callback_data=f"pp_{row['id']}",
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("⬅️ بازگشت", callback_data="main")
+    ])
+
+    await query.edit_message_text(
+        "💳 *درخواست‌های در انتظار واریز*\n\n"
+        "این افراد حساب گرفته‌اند ولی هنوز فیش ارسال نکرده‌اند:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def admin_payment_pending_item(update, context, request_id):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
+    row = conn.execute("""
+        SELECT * FROM requests
+        WHERE id = ?
+          AND status = 'reserved'
+          AND receipt_file_id IS NULL
+    """, (request_id,)).fetchone()
+    conn.close()
+
+    if not row:
+        await query.edit_message_text(
+            "❌ درخواست پیدا نشد یا فیش آن ارسال شده است.",
+            reply_markup=back_button(),
+        )
+        return
+
+    text = (
+        "💳 *درخواست در انتظار واریز*\n\n"
+        f"🆔 `{row['id']}`\n"
+        f"👤 نام رزرو: {row['reservation_name'] or row['first_name'] or '-'}\n"
+        f"🔹 @{row['username'] or '-'}\n"
+        f"🔢 `{row['user_id']}`\n"
+        f"🏦 شماره حساب: `{row['account_number_snapshot'] or '-'}`\n"
+        f"💰 `{fmt_amount(row['amount'])}` تومان\n\n"
+        "⚠️ هنوز فیش ارسال نشده است."
+    )
+
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ برگشت", callback_data="a_payment_pending")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
+        ]),
     )
 
 
@@ -1583,6 +2182,7 @@ async def admin_pending(update, context):
             receipt_file_id
         FROM requests
         WHERE status = 'reserved'
+          AND receipt_file_id IS NOT NULL
         ORDER BY id ASC
     """).fetchall()
 
@@ -1669,9 +2269,10 @@ async def pending_item(
     text = (
         "⏳ *جزئیات پرداخت*\n\n"
         f"🆔 `{row['id']}`\n"
-        f"👤 {row['first_name'] or '-'}\n"
+        f"👤 نام رزرو: {row['reservation_name'] or row['first_name'] or '-'}\n"
         f"🔹 @{row['username'] or '-'}\n"
         f"🔢 `{row['user_id']}`\n"
+        f"🏦 شماره هنگام رزرو: `{row['account_number_snapshot'] or '-'}`\n"
         f"💰 `{fmt_amount(row['amount'])}` تومان\n"
         f"{receipt}"
     )
@@ -1728,7 +2329,7 @@ async def add_account_menu(
         "فرمت:\n"
         "`نام|شماره‌حساب|سقف`\n\n"
         "مثال:\n"
-        "`علی امینی|6037991234567890|100000000`",
+        "`علی امینی|6037991234567890|11.5`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
     )
@@ -1760,9 +2361,6 @@ async def process_new_account(
     account = parts[1].strip()
     capacity = parse_amount(parts[2])
 
-    if capacity is not None:
-        capacity = capacity * 1_000_000
-        
     if not owner:
         await update.message.reply_text(
             "❌ نام خالی است."
@@ -1805,8 +2403,55 @@ async def process_new_account(
 
     target_id = cursor.lastrowid
 
-    # پس از اضافه شدن حساب، صف هوشمند را روی همین حساب اجرا می‌کنیم.
-    assigned = assign_waiting_requests(conn, target_id=target_id)
+    waiting = conn.execute("""
+        SELECT *
+        FROM requests
+        WHERE status = 'waiting'
+        ORDER BY id ASC
+    """).fetchall()
+
+    assigned = []
+
+    for request in waiting:
+
+        target = conn.execute("""
+            SELECT *
+            FROM payment_targets
+            WHERE id = ?
+        """, (
+            target_id,
+        )).fetchone()
+
+        if available_amount(target) < request["amount"]:
+            continue
+
+        conn.execute("""
+            UPDATE requests
+            SET target_id = ?,
+                account_number_snapshot = ?,
+                status = 'reserved',
+                updated_at = ?,
+                next_reminder_at = ?
+            WHERE id = ?
+        """, (
+            target_id,
+            account,
+            now_iso(),
+            reminder_due(),
+            request["id"],
+        ))
+
+        conn.execute("""
+            UPDATE payment_targets
+            SET reserved_amount =
+                reserved_amount + ?
+            WHERE id = ?
+        """, (
+            request["amount"],
+            target_id,
+        ))
+
+        assigned.append(dict(request))
 
     conn.commit()
     conn.close()
@@ -1824,220 +2469,31 @@ async def process_new_account(
         reply_markup=admin_menu(),
     )
 
-    await notify_assigned_requests(
-        context.bot,
-        assigned,
-    )
-
-
-# =========================================================
-# ADMIN SEARCH
-# =========================================================
-
-async def admin_search_menu(update, context):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user.id):
-        return
-
-    clear_state(context)
-    context.user_data["admin_search"] = True
-
-    await query.edit_message_text(
-        "🔎 *جستجوی درخواست*\n\n"
-        "شناسه درخواست، شناسه کاربر، username، نام کاربر یا مبلغ را وارد کنید.\n\n"
-        "مثال: `125` یا `@ali` یا `5000000`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=back_button(),
-    )
-
-
-async def process_admin_search(update, context):
-    if not context.user_data.get("admin_search"):
-        return
-
-    if not is_admin(update.effective_user.id):
-        return
-
-    term = update.message.text.strip()
-    clean = term.lstrip("@").replace(",", "")
-    like = f"%{clean}%"
-
-    conn = db()
-    rows = conn.execute("""
-        SELECT r.*, p.owner_name, p.account_number
-        FROM requests r
-        LEFT JOIN payment_targets p ON p.id = r.target_id
-        WHERE CAST(r.id AS TEXT) = ?
-           OR CAST(r.user_id AS TEXT) = ?
-           OR COALESCE(r.username, '') LIKE ?
-           OR COALESCE(r.first_name, '') LIKE ?
-           OR CAST(r.amount AS TEXT) = ?
-        ORDER BY r.id DESC
-        LIMIT 50
-    """, (clean, clean, like, like, clean)).fetchall()
-    conn.close()
-
-    clear_state(context)
-
-    names = {
-        "waiting": "⏳ در انتظار حساب",
-        "reserved": "🟡 رزرو شده",
-        "paid": "🟢 تایید شده",
-        "rejected": "🔴 رد شده",
-    }
-
-    if not rows:
-        await update.message.reply_text(
-            "🔎 نتیجه‌ای پیدا نشد.",
-            reply_markup=admin_menu(),
-        )
-        return
-
-    parts = ["🔎 *نتایج جستجو*\n"]
-    for row in rows:
-        parts.append(
-            f"🆔 `{row['id']}` | 💰 `{fmt_amount(row['amount'])}` تومان\n"
-            f"👤 {row['first_name'] or '-'} | @{row['username'] or '-'}\n"
-            f"🔢 کاربر: `{row['user_id']}`\n"
-            f"📌 {names.get(row['status'], row['status'])}\n"
-            f"🏦 {row['owner_name'] or '-'}\n"
-            "━━━━━━━━━━━━━━"
-        )
-
-    await update.message.reply_text(
-        "\n".join(parts),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
-    )
-
-
-# =========================================================
-# ADMIN REQUEST REPORT
-# =========================================================
-
-async def admin_report(update, context):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user.id):
-        return
-
-    conn = db()
-    s = conn.execute("""
-        SELECT
-            COUNT(*) AS total,
-            COALESCE(SUM(amount), 0) AS total_amount,
-            SUM(CASE WHEN status='waiting' THEN 1 ELSE 0 END) AS waiting_count,
-            COALESCE(SUM(CASE WHEN status='waiting' THEN amount ELSE 0 END),0) AS waiting_amount,
-            SUM(CASE WHEN status='reserved' THEN 1 ELSE 0 END) AS reserved_count,
-            COALESCE(SUM(CASE WHEN status='reserved' THEN amount ELSE 0 END),0) AS reserved_amount,
-            SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) AS paid_count,
-            COALESCE(SUM(CASE WHEN status='paid' THEN amount ELSE 0 END),0) AS paid_amount,
-            SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rejected_count,
-            COALESCE(SUM(CASE WHEN status='rejected' THEN amount ELSE 0 END),0) AS rejected_amount
-        FROM requests
-    """).fetchone()
-
-    t = conn.execute("""
-        SELECT
-            COUNT(*) AS total_accounts,
-            COALESCE(SUM(active),0) AS active_accounts,
-            COALESCE(SUM(capacity),0) AS capacity,
-            COALESCE(SUM(reserved_amount),0) AS reserved,
-            COALESCE(SUM(paid_amount),0) AS paid
-        FROM payment_targets
-    """).fetchone()
-    conn.close()
-
-    text = (
-        "📈 *گزارش کامل درخواست‌ها*\n\n"
-        f"📌 کل درخواست‌ها: `{s['total']}`\n"
-        f"💰 مجموع مبالغ: `{fmt_amount(s['total_amount'])}` تومان\n\n"
-        "━━━━━━━━━━━━━━\n"
-        f"⏳ در انتظار حساب: `{s['waiting_count'] or 0}`\n"
-        f"💰 `{fmt_amount(s['waiting_amount'])}` تومان\n\n"
-        f"🟡 رزرو شده: `{s['reserved_count'] or 0}`\n"
-        f"💰 `{fmt_amount(s['reserved_amount'])}` تومان\n\n"
-        f"🟢 تایید شده: `{s['paid_count'] or 0}`\n"
-        f"💰 `{fmt_amount(s['paid_amount'])}` تومان\n\n"
-        f"🔴 رد شده: `{s['rejected_count'] or 0}`\n"
-        f"💰 `{fmt_amount(s['rejected_amount'])}` تومان\n\n"
-        "━━━━━━━━━━━━━━\n"
-        f"🏦 کل حساب‌ها: `{t['total_accounts'] or 0}`\n"
-        f"🟢 حساب‌های فعال: `{t['active_accounts'] or 0}`\n"
-        f"💳 ظرفیت کل: `{fmt_amount(t['capacity'])}` تومان\n"
-        f"🟡 رزرو: `{fmt_amount(t['reserved'])}` تومان\n"
-        f"🟢 پرداخت: `{fmt_amount(t['paid'])}` تومان"
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏳ در انتظار حساب", callback_data="ar_waiting")],
-        [
-            InlineKeyboardButton("🟡 رزرو شده", callback_data="ar_reserved"),
-            InlineKeyboardButton("🟢 تایید شده", callback_data="ar_paid"),
-        ],
-        [InlineKeyboardButton("🔴 رد شده", callback_data="ar_rejected")],
-        [InlineKeyboardButton("⬅️ بازگشت", callback_data="main")],
-    ])
-
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
-    )
-
-
-async def admin_report_by_status(update, context, status):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user.id):
-        return
-
-    names = {
-        "waiting": "⏳ در انتظار حساب",
-        "reserved": "🟡 رزرو شده / در انتظار فیش",
-        "paid": "🟢 تایید شده",
-        "rejected": "🔴 رد شده",
-    }
-
-    conn = db()
-    rows = conn.execute("""
-        SELECT id, user_id, username, first_name, amount, target_id
-        FROM requests
-        WHERE status = ?
-        ORDER BY id ASC
-        LIMIT 100
-    """, (status,)).fetchall()
-    conn.close()
-
-    parts = [
-        f"📋 *{names[status]}*",
-        f"تعداد: `{len(rows)}`",
-        "",
-    ]
-
-    for row in rows:
-        parts.append(
-            f"🆔 `{row['id']}` | 💰 `{fmt_amount(row['amount'])}` تومان\n"
-            f"👤 {row['first_name'] or '-'} | @{row['username'] or '-'}\n"
-            f"🔢 کاربر: `{row['user_id']}` | 🏦 حساب: `{row['target_id'] or '-'}`\n"
-            "━━━━━━━━━━━━━━"
-        )
-
-    if not rows:
-        parts.append("درخواستی در این بخش وجود ندارد.")
-
-    await query.edit_message_text(
-        "\n".join(parts),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📈 گزارش کلی", callback_data="a_report")],
-            [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
-        ]),
-    )
+    # اطلاع کاربران
+    for request in assigned:
+        try:
+            await context.bot.send_message(
+                request["user_id"],
+                "🎉 *حساب برای شما آماده شد!*\n\n"
+                f"🆔 درخواست: `{request['id']}`\n"
+                f"👤 صاحب حساب: `{owner}`\n"
+                f"🏦 شماره حساب:\n"
+                f"`{account}`\n\n"
+                f"💰 مبلغ:\n"
+                f"`{fmt_amount(request['amount'])}` تومان\n\n"
+                "پس از پرداخت، فیش را ارسال کنید.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🧾 ارسال فیش",
+                            callback_data=f"r_{request['id']}",
+                        ),
+                    ],
+                ]),
+            )
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -2116,7 +2572,7 @@ async def history_item(
     )).fetchone()
 
     rows = conn.execute("""
-        SELECT id, amount, status
+        SELECT id, amount, status, reservation_name, account_number_snapshot, user_id, username, receipt_file_id
         FROM requests
         WHERE target_id = ?
         ORDER BY id DESC
@@ -2139,6 +2595,7 @@ async def history_item(
         "paid": "🟢 پرداخت",
         "rejected": "🔴 رد",
         "waiting": "⏳ انتظار",
+        "cancelled": "⚫ لغو شده",
     }
 
     parts = [
@@ -2158,6 +2615,8 @@ async def history_item(
         for row in rows:
             parts.append(
                 f"🆔 `{row['id']}` | "
+                f"👤 {row['reservation_name'] or "-"} | "
+                f"🏦 `{row['account_number_snapshot'] or target['account_number']}` | "
                 f"💰 `{fmt_amount(row['amount'])}` | "
                 f"{status_names.get(row['status'], row['status'])}"
             )
@@ -2250,6 +2709,14 @@ async def callback_router(
         )
         return
 
+    if data == "ur_cancelled":
+        await my_requests_by_status(
+            update,
+            context,
+            "cancelled",
+        )
+        return
+
     if data == "ur_paid":
         await my_requests_by_status(
             update,
@@ -2266,12 +2733,36 @@ async def callback_router(
         )
         return
 
+    if data == "ur_payment_pending":
+        await my_requests_by_status(
+            update,
+            context,
+            "payment_pending",
+        )
+        return
+
     if data == "ur_reserved":
         await my_requests_by_status(
             update,
             context,
             "reserved",
         )
+        return
+
+    # -----------------------------------------------------
+    # A CONTENT RECEIPTS
+    # -----------------------------------------------------
+
+    if data == "c_receipts":
+        await a_content_receipts(update, context)
+        return
+
+    if data.startswith("c_receipt_"):
+        try:
+            request_id = int(data[len("c_receipt_"):])
+        except ValueError:
+            return
+        await a_content_receipt_item(update, context, request_id)
         return
 
     # -----------------------------------------------------
@@ -2294,40 +2785,11 @@ async def callback_router(
         await query.edit_message_text(
             "ℹ️ *راهنما*\n\n"
             "💰 مبلغ را وارد کنید تا حساب مناسب اختصاص داده شود.\n\n"
-            "🧠 صف هوشمند است؛ درخواست بزرگ‌تر جلوی درخواست کوچک‌ترِ قابل‌انجام را نمی‌گیرد.\n\n"
             "🧾 پس از پرداخت، فیش را ارسال کنید.\n\n"
             "📋 از بخش درخواست‌های من می‌توانید وضعیت را ببینید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_button(),
         )
-        return
-
-    # -----------------------------------------------------
-    # ADMIN SEARCH / REPORT
-    # -----------------------------------------------------
-
-    if data == "a_search":
-        await admin_search_menu(update, context)
-        return
-
-    if data == "a_report":
-        await admin_report(update, context)
-        return
-
-    if data == "ar_waiting":
-        await admin_report_by_status(update, context, "waiting")
-        return
-
-    if data == "ar_reserved":
-        await admin_report_by_status(update, context, "reserved")
-        return
-
-    if data == "ar_paid":
-        await admin_report_by_status(update, context, "paid")
-        return
-
-    if data == "ar_rejected":
-        await admin_report_by_status(update, context, "rejected")
         return
 
     # -----------------------------------------------------
@@ -2353,8 +2815,56 @@ async def callback_router(
         return
 
     # -----------------------------------------------------
+    # ADMIN ACCOUNT MANAGEMENT
+    # -----------------------------------------------------
+
+    if data.startswith("a_target_delete_confirm_"):
+        try:
+            target_id = int(data[len("a_target_delete_confirm_"):])
+        except ValueError:
+            return
+        await admin_delete_target_confirm(update, context, target_id)
+        return
+
+    if data.startswith("a_target_reservations_"):
+        try:
+            target_id = int(data[len("a_target_reservations_"):])
+        except ValueError:
+            return
+        await admin_target_reservations(update, context, target_id)
+        return
+
+    if data.startswith("a_target_edit_"):
+        try:
+            target_id = int(data[len("a_target_edit_"):])
+        except ValueError:
+            return
+        await admin_edit_target_start(update, context, target_id)
+        return
+
+    if data.startswith("a_target_delete_"):
+        try:
+            target_id = int(data[len("a_target_delete_"):])
+        except ValueError:
+            return
+        await admin_delete_target(update, context, target_id)
+        return
+
+    # -----------------------------------------------------
     # ADMIN PENDING
     # -----------------------------------------------------
+
+    if data == "a_payment_pending":
+        await admin_payment_pending(update, context)
+        return
+
+    if data.startswith("pp_"):
+        try:
+            request_id = int(data[3:])
+        except ValueError:
+            return
+        await admin_payment_pending_item(update, context, request_id)
+        return
 
     if data == "a_pending":
         await admin_pending(
@@ -2373,27 +2883,7 @@ async def callback_router(
             context,
         )
         return
-    if data == "a_clear_history":
-        await admin_clear_history_confirm(
-            update,
-            context,
-        )
-        return
 
-    if data == "a_clear_confirm":
-        await admin_clear_history(
-            update,
-            context,
-        )
-        return
-
-    if data == "a_clear_cancel":
-        await query.answer()
-        await query.edit_message_text(
-            "❌ عملیات پاک کردن لغو شد.",
-            reply_markup=admin_menu()
-        )
-        return
     # -----------------------------------------------------
     # RECEIPT REQUEST
     # -----------------------------------------------------
@@ -2418,31 +2908,102 @@ async def callback_router(
             reply_markup=back_button(),
         )
         return
-        # -----------------------------------------------------
-    # A CONTENT RECEIPTS
+
+    # -----------------------------------------------------
+    # PAYMENT REMINDER - CONTINUE / CANCEL
     # -----------------------------------------------------
 
-    if data == "c_receipts":
-        await a_content_receipts(
-            update,
-            context,
-        )
-        return
-
-    if data.startswith("c_receipt_"):
+    if data.startswith("continue_payment_"):
         try:
-            request_id = int(
-                data[len("c_receipt_"):]
-            )
+            request_id = int(data[len("continue_payment_"):])
         except ValueError:
             return
 
-        await a_content_receipt_item(
-            update,
-            context,
-            request_id,
+        conn = db()
+        row = conn.execute("""
+            SELECT * FROM requests
+            WHERE id = ? AND user_id = ?
+        """, (request_id, query.from_user.id)).fetchone()
+
+        if row and row['status'] == 'reserved' and not row['receipt_file_id']:
+            conn.execute("""
+                UPDATE requests
+                SET next_reminder_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'reserved' AND receipt_file_id IS NULL
+            """, (next_reminder_after_now(), now_iso(), request_id))
+            conn.commit()
+        conn.close()
+
+        if not row or row['status'] != 'reserved' or row['receipt_file_id']:
+            await query.edit_message_text("❌ این درخواست دیگر در انتظار واریز نیست.")
+            return
+
+        await query.edit_message_text(
+            "▶️ *ادامه پرداخت*\n\n"
+            f"🆔 درخواست: `{request_id}`\n"
+            "درخواست شما فعال ماند. پس از پرداخت، فیش را ارسال کنید.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧾 ارسال فیش", callback_data=f"r_{request_id}")],
+                [InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests")],
+            ]),
         )
         return
+
+    if data.startswith("cancel_payment_"):
+        try:
+            request_id = int(data[len("cancel_payment_"):])
+        except ValueError:
+            return
+
+        conn = db()
+        row = conn.execute("""
+            SELECT * FROM requests
+            WHERE id = ? AND user_id = ?
+        """, (request_id, query.from_user.id)).fetchone()
+
+        if not row or row['status'] != 'reserved' or row['receipt_file_id']:
+            conn.close()
+            await query.edit_message_text("❌ این درخواست دیگر قابل لغو نیست.")
+            return
+
+        conn.execute("""
+            UPDATE requests
+            SET status = 'cancelled',
+                updated_at = ?,
+                next_reminder_at = NULL
+            WHERE id = ? AND user_id = ? AND status = 'reserved' AND receipt_file_id IS NULL
+        """, (now_iso(), request_id, query.from_user.id))
+
+        if row['target_id']:
+            conn.execute("""
+                UPDATE payment_targets
+                SET reserved_amount = MAX(0, reserved_amount - ?)
+                WHERE id = ?
+            """, (row['amount'], row['target_id']))
+
+        conn.commit()
+        conn.close()
+
+        await query.edit_message_text(
+            "❌ *درخواست لغو شد*\n\n"
+            f"🆔 درخواست: `{request_id}`\n"
+            "رزرو این درخواست آزاد شد.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=user_menu(),
+        )
+
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"❌ درخواست `{request_id}` توسط کاربر لغو شد.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        return
+
     # -----------------------------------------------------
     # APPROVE
     # -----------------------------------------------------
@@ -2535,7 +3096,7 @@ async def command_getaccount(
     if not context.args:
         await update.message.reply_text(
             "مثال:\n"
-            "`/getaccount 50000000`",
+            "`/getaccount 11.5`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -2544,17 +3105,20 @@ async def command_getaccount(
         context.args[0]
     )
 
-
     if amount is None:
         await update.message.reply_text(
             "❌ مبلغ نامعتبر است."
         )
         return
-    amount = amount * 1_000_000
-    await create_request(
-        update,
-        context,
-        amount,
+
+    context.user_data["pending_amount"] = amount
+    context.user_data["reservation_name"] = True
+
+    await update.message.reply_text(
+        "👤 لطفاً *نام و نام خانوادگی* خود را برای ثبت رزرو وارد کنید:\n\n"
+        "مثال: `علی رضایی`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_button(),
     )
 
 
@@ -2587,7 +3151,7 @@ async def command_receipt(
     conn = db()
 
     request = conn.execute("""
-        SELECT id, status
+        SELECT id, status, receipt_file_id
         FROM requests
         WHERE id = ?
         AND user_id = ?
@@ -2604,9 +3168,9 @@ async def command_receipt(
         )
         return
 
-    if request["status"] != "reserved":
+    if request["status"] != "reserved" or request["receipt_file_id"]:
         await update.message.reply_text(
-            "❌ این درخواست قابل ارسال فیش نیست."
+            "❌ این درخواست قابل ارسال فیش نیست یا فیش آن قبلاً ارسال شده است."
         )
         return
 
@@ -2629,6 +3193,20 @@ async def text_router(
     update,
     context,
 ):
+    if await receive_adpass_password(update, context):
+        return
+
+    if context.user_data.get("edit_target_id"):
+        await process_edit_target(update, context)
+        return
+
+    if context.user_data.get("reservation_name"):
+        await receive_reservation_name(
+            update,
+            context,
+        )
+        return
+
     if context.user_data.get("amount"):
         await receive_amount(
             update,
@@ -2650,12 +3228,93 @@ async def text_router(
         )
         return
 
-    if context.user_data.get("admin_search"):
-        await process_admin_search(
-            update,
-            context,
-        )
-        return
+
+# =========================================================
+# PAYMENT REMINDERS
+# =========================================================
+
+async def send_payment_reminder(bot, row):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❌ لغو درخواست", callback_data=f"cancel_payment_{row['id']}"),
+            InlineKeyboardButton("▶️ ادامه", callback_data=f"continue_payment_{row['id']}"),
+        ],
+    ])
+
+    text = (
+        "⏰ *یادآوری پرداخت*\n\n"
+        f"🆔 درخواست: `{row['id']}`\n"
+        f"💰 مبلغ: `{fmt_amount(row['amount'])}` تومان\n\n"
+        "از زمان درخواست شما ۲۴ ساعت گذشته و هنوز فیش پرداخت ارسال نشده است.\n\n"
+        "اگر می‌خواهید این درخواست لغو شود، «لغو درخواست» را بزنید.\n"
+        "اگر هنوز قصد پرداخت دارید، «ادامه» را بزنید."
+    )
+
+    await bot.send_message(
+        row['user_id'],
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+
+
+async def payment_reminder_loop(bot):
+    while True:
+        try:
+            conn = db()
+            now = datetime.now(timezone.utc).isoformat()
+            rows = conn.execute("""
+                SELECT id, user_id, amount, next_reminder_at
+                FROM requests
+                WHERE status = 'reserved'
+                  AND receipt_file_id IS NULL
+                  AND next_reminder_at IS NOT NULL
+                  AND next_reminder_at <= ?
+                ORDER BY id ASC
+                LIMIT 100
+            """, (now,)).fetchall()
+
+            for row in rows:
+                # ابتدا زمان یادآوری بعدی را جلو می‌بریم تا در اجرای همزمان دوباره ارسال نشود.
+                conn.execute("""
+                    UPDATE requests
+                    SET next_reminder_at = ?
+                    WHERE id = ?
+                      AND status = 'reserved'
+                      AND receipt_file_id IS NULL
+                """, (next_reminder_after_now(), row['id']))
+
+            conn.commit()
+            conn.close()
+
+            for row in rows:
+                try:
+                    await send_payment_reminder(bot, row)
+                except Exception:
+                    logger.exception("Failed to send payment reminder for request %s", row['id'])
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Payment reminder loop failed")
+
+        await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
+
+
+async def post_init(application):
+    application.bot_data["payment_reminder_task"] = asyncio.create_task(
+        payment_reminder_loop(application.bot)
+    )
+
+
+async def post_shutdown(application):
+    task = application.bot_data.get("payment_reminder_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 # =========================================================
@@ -2678,14 +3337,10 @@ async def error_handler(
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN در فایل .env تنظیم نشده است."
-        )
+        raise RuntimeError("BOT_TOKEN در ابتدای فایل تنظیم نشده است.")
 
     if not ADMIN_IDS:
-        raise RuntimeError(
-            "ADMIN_IDS در فایل .env تنظیم نشده است."
-        )
+        raise RuntimeError("حداقل یک ADMIN_ID باید در ابتدای فایل تنظیم شود.")
 
     init_db()
 
@@ -2710,6 +3365,8 @@ def main():
         .token(BOT_TOKEN)
         .request(bot_request)
         .get_updates_request(get_updates_request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .concurrent_updates(True)
         .build()
     )
@@ -2718,6 +3375,13 @@ def main():
         CommandHandler(
             "start",
             start,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "adpass",
+            command_adpass,
         )
     )
 
