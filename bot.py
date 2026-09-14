@@ -88,7 +88,6 @@ def db():
 
     conn.row_factory = sqlite3.Row
 
-    # سرعت و concurrency بهتر SQLite
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -342,6 +341,72 @@ def back_button():
 
 
 # =========================================================
+# USER REQUEST STATUS MENU
+# =========================================================
+
+def requests_status_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔴 رد شده ها",
+                callback_data="ur_rejected",
+            ),
+            InlineKeyboardButton(
+                "🟢 تایید شده ها",
+                callback_data="ur_paid",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⏳ در انتظار حساب",
+                callback_data="ur_waiting",
+            ),
+            InlineKeyboardButton(
+                "🟡 در انتظار تایید",
+                callback_data="ur_reserved",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ بازگشت",
+                callback_data="main",
+            ),
+        ],
+    ])
+
+
+def requests_status_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔴 رد شده ها",
+                callback_data="ur_rejected",
+            ),
+            InlineKeyboardButton(
+                "🟢 تایید شده ها",
+                callback_data="ur_paid",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⏳ در انتظار حساب",
+                callback_data="ur_waiting",
+            ),
+            InlineKeyboardButton(
+                "🟡 در انتظار تایید",
+                callback_data="ur_reserved",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ بازگشت",
+                callback_data="u_requests",
+            ),
+        ],
+    ])
+
+
+# =========================================================
 # MAIN MENU
 # =========================================================
 
@@ -411,8 +476,6 @@ async def start(update, context):
 async def get_account_menu(update, context):
     query = update.callback_query
 
-    # مهم‌ترین قسمت:
-    # بلافاصله به Telegram اعلام می‌کنیم کلیک دریافت شد.
     await query.answer()
 
     clear_state(context)
@@ -467,7 +530,6 @@ async def create_request(
 
     conn = db()
 
-    # یک Query برای پیدا کردن حساب مناسب
     targets = conn.execute("""
         SELECT *
         FROM payment_targets
@@ -659,10 +721,38 @@ async def create_request(
 # MY REQUESTS
 # =========================================================
 
-async def my_requests(update, context):
+async def my_requests_menu(update, context):
     query = update.callback_query
 
     await query.answer()
+
+    clear_state(context)
+
+    await query.edit_message_text(
+        "📋 *درخواست‌های من*\n\n"
+        "لطفاً وضعیت درخواست‌ها را انتخاب کنید:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=requests_status_menu(),
+    )
+
+
+async def my_requests_by_status(
+    update,
+    context,
+    status,
+):
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = update.effective_user.id
+
+    status_names = {
+        "waiting": "⏳ در انتظار حساب",
+        "reserved": "🟡 در انتظار تایید",
+        "paid": "🟢 تایید شده ها",
+        "rejected": "🔴 رد شده ها",
+    }
 
     conn = db()
 
@@ -671,36 +761,48 @@ async def my_requests(update, context):
             id,
             amount,
             status,
-            receipt_file_id
+            receipt_file_id,
+            created_at
         FROM requests
         WHERE user_id = ?
+        AND status = ?
         ORDER BY id DESC
         LIMIT 20
     """, (
-        update.effective_user.id,
+        user_id,
+        status,
     )).fetchall()
 
     conn.close()
 
-    status_names = {
-        "waiting": "⏳ انتظار حساب",
-        "reserved": "🟡 در انتظار تأیید",
-        "paid": "🟢 تأیید شده",
-        "rejected": "🔴 رد شده",
-    }
+    title = status_names.get(
+        status,
+        "درخواست‌ها",
+    )
+
+    # -----------------------------------------------------
+    # NO REQUEST
+    # -----------------------------------------------------
 
     if not rows:
+
         text = (
-            "📋 *درخواست‌های من*\n\n"
-            "درخواستی ثبت نشده است."
+            f"📋 *{title}*\n\n"
+            "درخواستی در این بخش وجود ندارد."
         )
 
+    # -----------------------------------------------------
+    # REQUESTS
+    # -----------------------------------------------------
+
     else:
+
         parts = [
-            "📋 *درخواست‌های من*\n"
+            f"📋 *{title}*\n"
         ]
 
         for row in rows:
+
             receipt = (
                 "🧾 فیش دریافت شده"
                 if row["receipt_file_id"]
@@ -708,9 +810,9 @@ async def my_requests(update, context):
             )
 
             parts.append(
-                f"🆔 `{row['id']}`\n"
-                f"💰 `{fmt_amount(row['amount'])}` تومان\n"
-                f"📌 {status_names.get(row['status'], row['status'])}\n"
+                f"🆔 درخواست: `{row['id']}`\n"
+                f"💰 مبلغ: `{fmt_amount(row['amount'])}` تومان\n"
+                f"📌 وضعیت: {status_names.get(row['status'], row['status'])}\n"
                 f"{receipt}\n"
                 "━━━━━━━━━━━━━━"
             )
@@ -720,7 +822,7 @@ async def my_requests(update, context):
     await query.edit_message_text(
         text,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=back_button(),
+        reply_markup=requests_status_keyboard(),
     )
 
 
@@ -931,7 +1033,6 @@ async def receive_receipt(
 async def approve(update, context, request_id):
     query = update.callback_query
 
-    # پاسخ فوری
     await query.answer("✅ تأیید شد")
 
     if not is_admin(query.from_user.id):
@@ -985,7 +1086,6 @@ async def approve(update, context, request_id):
     conn.commit()
     conn.close()
 
-    # حذف دکمه‌های قبلی
     try:
         await query.edit_message_reply_markup(
             reply_markup=None
@@ -993,7 +1093,6 @@ async def approve(update, context, request_id):
     except Exception:
         pass
 
-    # اطلاع کاربر
     try:
         await context.bot.send_message(
             request["user_id"],
@@ -1394,7 +1493,6 @@ async def process_new_account(
 
     target_id = cursor.lastrowid
 
-    # درخواست‌های منتظر
     waiting = conn.execute("""
         SELECT *
         FROM requests
@@ -1672,13 +1770,49 @@ async def callback_router(
         return
 
     # -----------------------------------------------------
-    # REQUESTS
+    # REQUESTS MENU
     # -----------------------------------------------------
 
     if data == "u_requests":
-        await my_requests(
+        await my_requests_menu(
             update,
             context,
+        )
+        return
+
+    # -----------------------------------------------------
+    # REQUESTS BY STATUS
+    # -----------------------------------------------------
+
+    if data == "ur_rejected":
+        await my_requests_by_status(
+            update,
+            context,
+            "rejected",
+        )
+        return
+
+    if data == "ur_paid":
+        await my_requests_by_status(
+            update,
+            context,
+            "paid",
+        )
+        return
+
+    if data == "ur_waiting":
+        await my_requests_by_status(
+            update,
+            context,
+            "waiting",
+        )
+        return
+
+    if data == "ur_reserved":
+        await my_requests_by_status(
+            update,
+            context,
+            "reserved",
         )
         return
 
@@ -2005,14 +2139,18 @@ async def error_handler(
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN در فایل .env تنظیم نشده است.")
+        raise RuntimeError(
+            "BOT_TOKEN در فایل .env تنظیم نشده است."
+        )
 
     if not ADMIN_IDS:
-        raise RuntimeError("ADMIN_IDS در فایل .env تنظیم نشده است.")
+        raise RuntimeError(
+            "ADMIN_IDS در فایل .env تنظیم نشده است."
+        )
 
     init_db()
 
-    BOT_REQUEST = HTTPXRequest(
+    bot_request = HTTPXRequest(
         connection_pool_size=100,
         pool_timeout=5.0,
         connect_timeout=5.0,
@@ -2020,7 +2158,7 @@ def main():
         write_timeout=30.0,
     )
 
-    GET_UPDATES_REQUEST = HTTPXRequest(
+    get_updates_request = HTTPXRequest(
         connection_pool_size=100,
         pool_timeout=5.0,
         connect_timeout=5.0,
@@ -2031,35 +2169,56 @@ def main():
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .request(BOT_REQUEST)
-        .get_updates_request(GET_UPDATES_REQUEST)
+        .request(bot_request)
+        .get_updates_request(get_updates_request)
         .concurrent_updates(True)
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("getaccount", get_account_menu))
-    application.add_handler(CommandHandler("receipt", receipt_menu))
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
 
     application.add_handler(
-        CallbackQueryHandler(callback_router)
+        CommandHandler(
+            "getaccount",
+            command_getaccount,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "receipt",
+            command_receipt,
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            callback_router
+        )
     )
 
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            text_router
+            text_router,
         )
     )
 
     application.add_handler(
         MessageHandler(
             filters.PHOTO | filters.Document.ALL,
-            receive_receipt
+            receive_receipt,
         )
     )
 
-    application.add_error_handler(error_handler)
+    application.add_error_handler(
+        error_handler
+    )
 
     print("ربات در حال اجراست...")
 
@@ -2068,10 +2227,6 @@ def main():
         allowed_updates=Update.ALL_TYPES,
     )
 
-
-if __name__ == "__main__":
-    main()
-# =========================================================
 
 if __name__ == "__main__":
     main()
