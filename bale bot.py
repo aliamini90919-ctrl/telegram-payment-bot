@@ -1,93 +1,315 @@
 import asyncio
 import logging
-import os
 import sqlite3
+import json
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.request import HTTPXRequest
-
+import httpx
 
 # =========================================================
-# CONFIG
+# BALE CONFIG
 # =========================================================
-
-# =========================================================
-# تنظیمات اصلی — بدون نیاز به فایل .env
-# =========================================================
-# توکن همین ربات را اینجا قرار بده.
 BOT_TOKEN = "1877548228:PL0XsIcN_pkbn6oG9V_xpNkB2SCw2t9jyxU"
-
-# شناسه عددی ادمین‌های اصلی
 ADMIN_IDS = {
-    1000885670,
     1962675244,
+    1000885670,
 }
-
-# رمز /adpass برای تبدیل کاربر عادی به ادمین
-ADPASS_PASSWORD = "1212"
-
-# ادمین‌هایی که از طریق /adpass ارتقا پیدا کرده‌اند؛ در دیتابیس هم ذخیره می‌شوند.
+ADPASS_PASSWORD = "@dm1nP@33w0rd"
 PROMOTED_ADMIN_IDS = set()
-
-# فایل دیتابیس این ربات
-DB_PATH = "payments.db"
-
-# تنها کاربری که نقش A Content دارد
+DB_PATH = "payments_bale.db"
 A_CONTENT_ID = 7118132097
-
-# اعداد ورودی کاربر/سقف حساب بر حسب «میلیون تومان» هستند.
 AMOUNT_MULTIPLIER = 1_000_000
-
 REMINDER_INTERVAL_SECONDS = 3600
 REMINDER_AFTER_HOURS = 24
+BALE_API_BASE = "https://tapi.bale.ai/bot"
 
-
-# =========================================================
-# LOGGING
-# =========================================================
-
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# =========================================================
-# TELEGRAM CONNECTION - HIGH PERFORMANCE
-# =========================================================
+class ParseMode:
+    MARKDOWN = "Markdown"
+    MARKDOWN_V2 = "MarkdownV2"
+    HTML = "HTML"
 
-BOT_REQUEST = HTTPXRequest(
-    connection_pool_size=100,
-    pool_timeout=5.0,
-    connect_timeout=5.0,
-    read_timeout=30.0,
-    write_timeout=30.0,
-)
 
-GET_UPDATES_REQUEST = HTTPXRequest(
-    connection_pool_size=100,
-    pool_timeout=5.0,
-    connect_timeout=5.0,
-    read_timeout=35.0,
-    write_timeout=30.0,
-)
+class InlineKeyboardButton:
+    def __init__(self, text, callback_data=None, url=None):
+        self.text = text
+        self.callback_data = callback_data
+        self.url = url
+
+
+class InlineKeyboardMarkup:
+    def __init__(self, inline_keyboard):
+        self.inline_keyboard = inline_keyboard
+
+    def to_dict(self):
+        rows = []
+        for row in self.inline_keyboard or []:
+            out = []
+            for b in row:
+                item = {"text": b.text}
+                if b.callback_data is not None:
+                    item["callback_data"] = str(b.callback_data)
+                if b.url is not None:
+                    item["url"] = b.url
+                out.append(item)
+            rows.append(out)
+        return {"inline_keyboard": rows}
+
+
+class _User:
+    def __init__(self, data):
+        data = data or {}
+        self.id = int(data.get("id", 0))
+        self.username = data.get("username")
+        self.first_name = data.get("first_name") or data.get("firstName") or "کاربر"
+        self.last_name = data.get("last_name") or data.get("lastName")
+        self.is_bot = bool(data.get("is_bot", False))
+
+
+class _FileItem:
+    def __init__(self, data):
+        self.file_id = None
+        self.file_unique_id = None
+        if isinstance(data, dict):
+            self.file_id = data.get("file_id") or data.get("fileId") or data.get("id")
+            self.file_unique_id = data.get("file_unique_id") or data.get("fileUniqueId")
+        else:
+            self.file_id = str(data)
+
+
+class BaleMessage:
+    def __init__(self, bot, data):
+        self._bot = bot
+        self.raw = data or {}
+        self.message_id = self.raw.get("message_id") or self.raw.get("messageId")
+        self.text = self.raw.get("text") or ""
+        self.from_user = _User(self.raw.get("from") or self.raw.get("sender"))
+        self.chat = self.raw.get("chat") or {}
+        self.chat_id = self.chat.get("id") if isinstance(self.chat, dict) else self.chat
+        self.photo = [_FileItem(x) for x in (self.raw.get("photo") or [])]
+        doc = self.raw.get("document") or self.raw.get("file")
+        self.document = _FileItem(doc) if doc else None
+
+    async def reply_text(self, text, reply_markup=None, parse_mode=None, **kwargs):
+        return await self._bot.send_message(self.chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
+
+    async def reply_photo(self, photo, caption=None, reply_markup=None, parse_mode=None, **kwargs):
+        return await self._bot.send_photo(self.chat_id, photo=photo, caption=caption, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
+
+    async def reply_document(self, document, caption=None, reply_markup=None, parse_mode=None, **kwargs):
+        return await self._bot.send_document(self.chat_id, document=document, caption=caption, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
+
+
+class BaleCallbackQuery:
+    def __init__(self, bot, data):
+        self._bot = bot
+        self.raw = data or {}
+        self.id = self.raw.get("id")
+        self.data = self.raw.get("data") or self.raw.get("callback_data") or ""
+        self.from_user = _User(self.raw.get("from") or self.raw.get("user"))
+        msg = self.raw.get("message") or {}
+        self.message = BaleMessage(bot, msg) if msg else None
+
+    async def answer(self, text=None, show_alert=False):
+        return await self._bot.answer_callback_query(self.id, text=text, show_alert=show_alert)
+
+    async def edit_message_text(self, text, reply_markup=None, parse_mode=None, **kwargs):
+        if not self.message:
+            return None
+        return await self._bot.edit_message_text(self.message.chat_id, self.message.message_id, text, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
+
+    async def edit_message_reply_markup(self, reply_markup=None, **kwargs):
+        if not self.message:
+            return None
+        return await self._bot.edit_message_reply_markup(self.message.chat_id, self.message.message_id, reply_markup=reply_markup, **kwargs)
+
+
+class BaleUpdate:
+    def __init__(self, bot, data):
+        self.raw = data or {}
+        self.update_id = self.raw.get("update_id") or self.raw.get("updateId")
+        self.message = BaleMessage(bot, self.raw["message"]) if self.raw.get("message") else None
+        self.callback_query = BaleCallbackQuery(bot, self.raw["callback_query"]) if self.raw.get("callback_query") else None
+
+    @property
+    def effective_user(self):
+        if self.message:
+            return self.message.from_user
+        if self.callback_query:
+            return self.callback_query.from_user
+        return _User({})
+
+
+class BaleContext:
+    def __init__(self, bot, user_data, bot_data):
+        self.bot = bot
+        self.user_data = user_data
+        self.bot_data = bot_data
+        self.error = None
+
+
+class BaleBot:
+    def __init__(self, token):
+        self.token = token
+        self.base_url = f"{BALE_API_BASE}{token}"
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=10.0))
+
+    async def close(self):
+        await self.client.aclose()
+
+    async def request(self, method, payload=None, files=None):
+        url = f"{self.base_url}/{method}"
+        try:
+            if files:
+                response = await self.client.post(url, data=payload or {}, files=files)
+            else:
+                response = await self.client.post(url, json=payload or {})
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok", True):
+                raise RuntimeError(f"Bale API {method} failed: {data}")
+            return data.get("result", data)
+        except Exception:
+            logger.exception("Bale API request failed: %s", method)
+            raise
+
+    @staticmethod
+    def _markup(reply_markup):
+        return reply_markup.to_dict() if hasattr(reply_markup, "to_dict") else reply_markup
+
+    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None, **kwargs):
+        payload = {"chat_id": chat_id, "text": str(text)}
+        markup = self._markup(reply_markup)
+        if markup:
+            payload["reply_markup"] = markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if kwargs.get("reply_to_message_id"):
+            payload["reply_to_message_id"] = kwargs["reply_to_message_id"]
+        return await self.request("sendMessage", payload)
+
+    async def send_photo(self, chat_id, photo, caption=None, reply_markup=None, parse_mode=None, **kwargs):
+        payload = {"chat_id": chat_id}
+        markup = self._markup(reply_markup)
+        if markup:
+            payload["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+        if caption:
+            payload["caption"] = caption
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if isinstance(photo, (str, int)):
+            payload["photo"] = str(photo)
+            return await self.request("sendPhoto", payload)
+        files = {"photo": (getattr(photo, "name", "photo.jpg"), photo)}
+        return await self.request("sendPhoto", payload, files=files)
+
+    async def send_document(self, chat_id, document, caption=None, reply_markup=None, parse_mode=None, **kwargs):
+        payload = {"chat_id": chat_id}
+        markup = self._markup(reply_markup)
+        if markup:
+            payload["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+        if caption:
+            payload["caption"] = caption
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if isinstance(document, (str, int)):
+            payload["document"] = str(document)
+            return await self.request("sendDocument", payload)
+        files = {"document": (getattr(document, "name", "document"), document)}
+        return await self.request("sendDocument", payload, files=files)
+
+    async def edit_message_text(self, chat_id, message_id, text, reply_markup=None, parse_mode=None, **kwargs):
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": str(text)}
+        markup = self._markup(reply_markup)
+        if markup:
+            payload["reply_markup"] = markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        return await self.request("editMessageText", payload)
+
+    async def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None, **kwargs):
+        payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": self._markup(reply_markup) if reply_markup else {"inline_keyboard": []}}
+        return await self.request("editMessageReplyMarkup", payload)
+
+    async def answer_callback_query(self, callback_query_id, text=None, show_alert=False):
+        payload = {"callback_query_id": callback_query_id, "show_alert": bool(show_alert)}
+        if text:
+            payload["text"] = text
+        return await self.request("answerCallbackQuery", payload)
+
+
+class _HandlerLoop:
+    def __init__(self, bot):
+        self.bot = bot
+        self.user_data = {}
+        self.bot_data = {}
+        self.offset = 0
+        self.running = True
+
+    def context_for(self, user_id):
+        return BaleContext(self.bot, self.user_data.setdefault(int(user_id), {}), self.bot_data)
+
+    async def dispatch(self, update):
+        user = update.effective_user
+        ctx = self.context_for(user.id)
+        try:
+            if update.callback_query:
+                await callback_router(update, ctx)
+                return
+            if not update.message:
+                return
+            text = update.message.text or ""
+            if text.startswith("/"):
+                command = text.split()[0].split("@")[0][1:].lower()
+                args = text.split()[1:]
+                ctx.args = args
+                if command == "start":
+                    await start(update, ctx)
+                elif command == "adpass":
+                    await command_adpass(update, ctx)
+                elif command == "getaccount":
+                    await command_getaccount(update, ctx)
+                elif command == "receipt":
+                    await command_receipt(update, ctx)
+                return
+            if update.message.photo or update.message.document:
+                await receive_receipt(update, ctx)
+                return
+            await text_router(update, ctx)
+        except Exception as exc:
+            ctx.error = exc
+            await error_handler(update, ctx)
+
+    async def run(self):
+        await post_init(BaleApplicationShim(self.bot, self.bot_data))
+        try:
+            while self.running:
+                try:
+                    result = await self.bot.request("getUpdates", {"offset": self.offset, "timeout": 25, "limit": 100})
+                    for raw in result or []:
+                        uid = raw.get("update_id") or raw.get("updateId")
+                        if uid is not None:
+                            self.offset = int(uid) + 1
+                        await self.dispatch(BaleUpdate(self.bot, raw))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Polling failed; retrying in 3 seconds")
+                    await asyncio.sleep(3)
+        finally:
+            await post_shutdown(BaleApplicationShim(self.bot, self.bot_data))
+            await self.bot.close()
+
+
+class BaleApplicationShim:
+    def __init__(self, bot, bot_data):
+        self.bot = bot
+        self.bot_data = bot_data
 
 
 # =========================================================
@@ -3337,98 +3559,16 @@ async def error_handler(
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN در ابتدای فایل تنظیم نشده است.")
-
+        raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
     if not ADMIN_IDS:
-        raise RuntimeError("حداقل یک ADMIN_ID باید در ابتدای فایل تنظیم شود.")
-
+        raise RuntimeError("حداقل یک ADMIN_ID باید تنظیم شود.")
     init_db()
-
-    bot_request = HTTPXRequest(
-        connection_pool_size=100,
-        pool_timeout=5.0,
-        connect_timeout=5.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-    )
-
-    get_updates_request = HTTPXRequest(
-        connection_pool_size=100,
-        pool_timeout=5.0,
-        connect_timeout=5.0,
-        read_timeout=35.0,
-        write_timeout=30.0,
-    )
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(bot_request)
-        .get_updates_request(get_updates_request)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .concurrent_updates(True)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "adpass",
-            command_adpass,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "getaccount",
-            command_getaccount,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "receipt",
-            command_receipt,
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            callback_router
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_router,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.PHOTO | filters.Document.ALL,
-            receive_receipt,
-        )
-    )
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    print("ربات در حال اجراست...")
-
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    print("ربات بله در حال اجراست...")
+    loop = _HandlerLoop(BaleBot(BOT_TOKEN))
+    try:
+        asyncio.run(loop.run())
+    except KeyboardInterrupt:
+        print("ربات متوقف شد.")
 
 
 if __name__ == "__main__":
