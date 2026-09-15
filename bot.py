@@ -122,6 +122,7 @@ def init_db():
         reserved_amount INTEGER NOT NULL DEFAULT 0,
         paid_amount INTEGER NOT NULL DEFAULT 0,
         active INTEGER NOT NULL DEFAULT 1,
+        deadline_at TEXT,
         created_at TEXT NOT NULL
     );
 
@@ -237,6 +238,8 @@ def init_db():
 
         "created_at":
             "ALTER TABLE payment_targets ADD COLUMN created_at TEXT",
+        "deadline_at":
+            "ALTER TABLE payment_targets ADD COLUMN deadline_at TEXT",
     }
 
     for column, sql in target_migrations.items():
@@ -373,6 +376,27 @@ def parse_iso(value):
         return dt
     except (TypeError, ValueError):
         return None
+
+
+def parse_deadline(value):
+    value = (value or "").strip()
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Tehran"))
+        return dt.astimezone(timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def deadline_display(value):
+    dt = parse_iso(value)
+    if not dt:
+        return "بدون ددلاین"
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 
 def reminder_due(created_at=None):
@@ -839,14 +863,12 @@ async def create_request(
         SELECT *
         FROM payment_targets
         WHERE active = 1
-        AND (
-            capacity
-            - reserved_amount
-            - paid_amount
-        ) >= ?
-        ORDER BY id ASC
+        AND (deadline_at IS NULL OR deadline_at > ?)
+        AND (capacity - reserved_amount - paid_amount) >= ?
+        ORDER BY CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC, deadline_at ASC, id ASC
         LIMIT 1
     """, (
+        now_iso(),
         amount,
     )).fetchone()
 
@@ -1696,7 +1718,8 @@ async def admin_status(update, context):
             capacity,
             reserved_amount,
             paid_amount,
-            active
+            active,
+            deadline_at
         FROM payment_targets
         ORDER BY id ASC
     """).fetchall()
@@ -1725,6 +1748,7 @@ async def admin_status(update, context):
             f"🟡 رزرو: `{fmt_amount(row['reserved_amount'])}`\n"
             f"🟢 پرداخت: `{fmt_amount(row['paid_amount'])}`\n"
             f"📊 باقی: `{fmt_amount(remaining)}`\n"
+            f"⏰ ددلاین: `{deadline_display(row['deadline_at'])}`\n"
             "━━━━━━━━━━━━━━"
         )
 
@@ -2313,6 +2337,28 @@ async def pending_item(
     )
 
 
+async def assign_waiting_requests(context, conn):
+    assigned = []
+    while True:
+        request = conn.execute("SELECT * FROM requests WHERE status = 'waiting' ORDER BY id ASC LIMIT 1").fetchone()
+        if not request:
+            break
+        target = conn.execute("""
+            SELECT * FROM payment_targets
+            WHERE active = 1 AND (deadline_at IS NULL OR deadline_at > ?)
+              AND (capacity - reserved_amount - paid_amount) >= ?
+            ORDER BY CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC, deadline_at ASC, id ASC
+            LIMIT 1
+        """, (now_iso(), request['amount'])).fetchone()
+        if not target:
+            break
+        now = now_iso()
+        conn.execute("""UPDATE requests SET target_id=?, account_number_snapshot=?, status='reserved', updated_at=?, next_reminder_at=? WHERE id=? AND status='waiting'""", (target['id'], target['account_number'], now, reminder_due(now), request['id']))
+        conn.execute("UPDATE payment_targets SET reserved_amount=reserved_amount+? WHERE id=?", (request['amount'], target['id']))
+        assigned.append((dict(request), dict(target)))
+    return assigned
+
+
 # =========================================================
 # ADD ACCOUNT
 # =========================================================
@@ -2337,9 +2383,10 @@ async def add_account_menu(
     await query.edit_message_text(
         "➕ *افزودن حساب*\n\n"
         "فرمت:\n"
-        "`نام|شماره‌حساب|سقف`\n\n"
+        "`نام|شماره‌حساب|سقف|ددلاین`\n\n"
+        "ددلاین به وقت ایران: `YYYY-MM-DD HH:MM`\n\n"
         "مثال:\n"
-        "`علی امینی|6037991234567890|11.5`",
+        "`علی امینی|6037991234567890|11.5|2026-09-20 18:00`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
     )
@@ -2359,10 +2406,11 @@ async def process_new_account(
 
     parts = update.message.text.split("|")
 
-    if len(parts) != 3:
+    if len(parts) != 4:
         await update.message.reply_text(
             "❌ فرمت اشتباه است.\n\n"
-            "`نام|شماره‌حساب|سقف`",
+            "`نام|شماره‌حساب|سقف|ددلاین`\n\n"
+            "ددلاین: `YYYY-MM-DD HH:MM` به وقت ایران",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -2370,6 +2418,7 @@ async def process_new_account(
     owner = parts[0].strip()
     account = parts[1].strip()
     capacity = parse_amount(parts[2])
+    deadline_at = parse_deadline(parts[3])
 
     if not owner:
         await update.message.reply_text(
@@ -2389,79 +2438,29 @@ async def process_new_account(
         )
         return
 
+    if deadline_at is None:
+        await update.message.reply_text(
+            "❌ ددلاین نامعتبر است.\n\nفرمت صحیح: `YYYY-MM-DD HH:MM` به وقت ایران",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if parse_iso(deadline_at) <= datetime.now(timezone.utc):
+        await update.message.reply_text("❌ ددلاین باید در آینده باشد.")
+        return
+
     conn = db()
 
     cursor = conn.execute("""
         INSERT INTO payment_targets (
-            owner_name,
-            account_number,
-            capacity,
-            reserved_amount,
-            paid_amount,
-            active,
-            created_at
+            owner_name, account_number, capacity, reserved_amount,
+            paid_amount, active, deadline_at, created_at
         )
-        VALUES (
-            ?, ?, ?, 0, 0, 1, ?
-        )
-    """, (
-        owner,
-        account,
-        capacity,
-        now_iso(),
-    ))
+        VALUES (?, ?, ?, 0, 0, 1, ?, ?)
+    """, (owner, account, capacity, deadline_at, now_iso()))
 
     target_id = cursor.lastrowid
 
-    waiting = conn.execute("""
-        SELECT *
-        FROM requests
-        WHERE status = 'waiting'
-        ORDER BY id ASC
-    """).fetchall()
-
-    assigned = []
-
-    for request in waiting:
-
-        target = conn.execute("""
-            SELECT *
-            FROM payment_targets
-            WHERE id = ?
-        """, (
-            target_id,
-        )).fetchone()
-
-        if available_amount(target) < request["amount"]:
-            continue
-
-        conn.execute("""
-            UPDATE requests
-            SET target_id = ?,
-                account_number_snapshot = ?,
-                status = 'reserved',
-                updated_at = ?,
-                next_reminder_at = ?
-            WHERE id = ?
-        """, (
-            target_id,
-            account,
-            now_iso(),
-            reminder_due(),
-            request["id"],
-        ))
-
-        conn.execute("""
-            UPDATE payment_targets
-            SET reserved_amount =
-                reserved_amount + ?
-            WHERE id = ?
-        """, (
-            request["amount"],
-            target_id,
-        ))
-
-        assigned.append(dict(request))
+    assigned = await assign_waiting_requests(context, conn)
 
     conn.commit()
     conn.close()
@@ -2473,22 +2472,23 @@ async def process_new_account(
         f"🆔 `{target_id}`\n"
         f"👤 `{owner}`\n"
         f"🏦 `{account}`\n"
-        f"💳 `{fmt_amount(capacity)}` تومان\n\n"
+        f"💳 `{fmt_amount(capacity)}` تومان\n"
+        f"⏰ ددلاین: `{deadline_display(deadline_at)}`\n\n"
         f"🔄 درخواست اختصاص‌یافته: `{len(assigned)}`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=admin_menu(),
     )
 
     # اطلاع کاربران
-    for request in assigned:
+    for request, target in assigned:
         try:
             await context.bot.send_message(
                 request["user_id"],
                 "🎉 *حساب برای شما آماده شد!*\n\n"
                 f"🆔 درخواست: `{request['id']}`\n"
-                f"👤 صاحب حساب: `{owner}`\n"
+                f"👤 صاحب حساب: `{target['owner_name']}`\n"
                 f"🏦 شماره حساب:\n"
-                f"`{account}`\n\n"
+                f"`{target['account_number']}`\n\n"
                 f"💰 مبلغ:\n"
                 f"`{fmt_amount(request['amount'])}` تومان\n\n"
                 "پس از پرداخت، فیش را ارسال کنید.",
