@@ -68,6 +68,42 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# شناسه آخرین پیام تعاملی هر کاربر؛ برای جلوگیری از استفاده از دکمه‌های پیام‌های قدیمی
+LATEST_INTERACTIVE_MESSAGE = {}
+
+
+def _track_interactive_message(message):
+    if message is not None and getattr(message, "reply_markup", None):
+        LATEST_INTERACTIVE_MESSAGE[message.chat_id] = message.message_id
+
+
+# رنگ واقعی برای دکمه‌های تلگرام توسط Bot API پشتیبانی نمی‌شود؛
+# بنابراین از ایموجی‌های رنگی برای ظاهر یکدست و زیبا استفاده می‌کنیم.
+BUTTON_COLOR_MAP = {
+    "دریافت حساب": "🔵", "درخواست‌های من": "🟣", "ارسال فیش": "🟠",
+    "راهنما": "🔷", "افزودن حساب": "🟢", "وضعیت حساب‌ها": "🔵",
+    "در انتظار واریز": "🟡", "فیش‌های در انتظار تایید": "🟠",
+    "فیش‌های دریافتی": "🟣", "تاریخچه": "🟪", "پنل کاربر": "⚪",
+    "رد شده ها": "🔴", "تایید شده ها": "🟢", "لغو شده ها": "⚫",
+    "در انتظار حساب": "🟡", "در انتظار تایید فیش": "🟠",
+    "تأیید": "🟢", "رد": "🔴", "ادامه": "🟢", "لغو درخواست": "🔴",
+    "بازگشت": "◀️", "منوی اصلی": "🏠",
+}
+
+def colored_button_text(text):
+    # اگر از قبل ایموجی رنگی/عملیاتی دارد، دوباره چیزی اضافه نکن.
+    stripped = text.strip()
+    if not stripped:
+        return text
+    for prefix in BUTTON_COLOR_MAP.values():
+        if stripped.startswith(prefix):
+            return text
+    for key, prefix in BUTTON_COLOR_MAP.items():
+        if stripped == key or stripped.endswith(key):
+            return text.replace(key, prefix + " " + key, 1)
+    return text
+
+
 
 # =========================================================
 # TELEGRAM CONNECTION - HIGH PERFORMANCE
@@ -536,7 +572,7 @@ def back_button():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "⬅️ بازگشت",
+                "🏠 منوی اصلی",
                 callback_data="main",
             ),
         ],
@@ -583,7 +619,7 @@ def requests_status_menu():
         ],
         [
             InlineKeyboardButton(
-                "⬅️ بازگشت",
+                "🏠 منوی اصلی",
                 callback_data="main",
             ),
         ],
@@ -1221,7 +1257,7 @@ async def receipt_menu(update, context):
             )
         ])
 
-    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")])
 
     await query.edit_message_text(
         "🧾 *ارسال فیش*\n\n"
@@ -1461,7 +1497,7 @@ async def a_content_receipts(update, context):
                 callback_data=f"c_receipt_{row['id']}",
             )
         ])
-    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")])
 
     await query.edit_message_text(
         "🧾 *فیش‌های دریافتی*\n\nیک فیش را برای بررسی انتخاب کنید:",
@@ -1771,7 +1807,7 @@ async def admin_status(update, context):
             ])
 
     keyboard.append([
-        InlineKeyboardButton("⬅️ بازگشت", callback_data="main")
+        InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")
     ])
 
     await query.edit_message_text(
@@ -1900,7 +1936,7 @@ async def process_edit_target(update, context):
 
     new_account = (update.message.text or "").strip()
     if not new_account or len(new_account) < 4 or len(new_account) > 100:
-        await update.message.reply_text("❌ شماره حساب نامعتبر است. دوباره وارد کنید.")
+        await update.message.reply_text("❌ شماره حساب نامعتبر است. دوباره وارد کنید.", reply_markup=back_button())
         return
 
     conn = db()
@@ -2140,7 +2176,7 @@ async def admin_payment_pending(update, context):
         ])
 
     keyboard.append([
-        InlineKeyboardButton("⬅️ بازگشت", callback_data="main")
+        InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")
     ])
 
     await query.edit_message_text(
@@ -2445,7 +2481,7 @@ async def process_new_account(
         )
         return
     if parse_iso(deadline_at) <= datetime.now(timezone.utc):
-        await update.message.reply_text("❌ ددلاین باید در آینده باشد.")
+        await update.message.reply_text("❌ ددلاین باید در آینده باشد.", reply_markup=back_button())
         return
 
     conn = db()
@@ -2648,6 +2684,16 @@ async def callback_router(
 ):
     query = update.callback_query
     data = query.data
+
+    # فقط دکمه‌های آخرین پیام تعاملی معتبر هستند.
+    # این کار جلوی کلیک روی دکمه‌های پیام‌های قبلی را می‌گیرد.
+    latest_message_id = LATEST_INTERACTIVE_MESSAGE.get(query.from_user.id)
+    if latest_message_id is not None and query.message and query.message.message_id != latest_message_id:
+        try:
+            await query.answer("⚠️ لطفاً از آخرین پیام استفاده کنید.", show_alert=True)
+        except Exception:
+            pass
+        return
 
     # -----------------------------------------------------
     # جواب فوری به Telegram
@@ -2938,8 +2984,9 @@ async def callback_router(
             "درخواست شما فعال ماند. پس از پرداخت، فیش را ارسال کنید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧾 ارسال فیش", callback_data=f"r_{request_id}")],
+                [InlineKeyboardButton("🧾 ارسال فیش", callback_data="u_receipt")],
                 [InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
             ]),
         )
         return
@@ -3153,7 +3200,7 @@ async def command_receipt(update, context):
             )
         ])
 
-    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")])
 
     await update.message.reply_text(
         "🧾 *ارسال فیش*\\n\\n"
@@ -3210,6 +3257,7 @@ async def send_payment_reminder(bot, row):
             InlineKeyboardButton("❌ لغو درخواست", callback_data=f"cancel_payment_{row['id']}"),
             InlineKeyboardButton("▶️ ادامه", callback_data=f"continue_payment_{row['id']}"),
         ],
+        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
     ])
 
     text = (
@@ -3303,10 +3351,67 @@ async def error_handler(
 
 
 # =========================================================
+# UI HOOKS
+# =========================================================
+
+def _install_ui_hooks():
+    # همه دکمه‌های InlineKeyboardButton را با ایموجی رنگی یکدست می‌کنیم.
+    original_button_init = InlineKeyboardButton.__init__
+    if not getattr(InlineKeyboardButton, "_ui_color_hook", False):
+        def button_init(self, text, *args, **kwargs):
+            text = colored_button_text(text)
+            return original_button_init(self, text, *args, **kwargs)
+        InlineKeyboardButton.__init__ = button_init
+        InlineKeyboardButton._ui_color_hook = True
+
+    # پیام‌های دارای کیبورد را به عنوان آخرین پیام تعاملی ثبت می‌کنیم.
+    from telegram import Message, Bot
+    if not getattr(Message, "_ui_tracking_hook", False):
+        original_reply_text = Message.reply_text
+
+        async def reply_text_hook(self, *args, **kwargs):
+            if kwargs.get("reply_markup") is None:
+                kwargs["reply_markup"] = back_button()
+            msg = await original_reply_text(self, *args, **kwargs)
+            _track_interactive_message(msg)
+            return msg
+
+        Message.reply_text = reply_text_hook
+        Message._ui_tracking_hook = True
+
+    if not getattr(Bot, "_ui_tracking_hook", False):
+        original_send_message = Bot.send_message
+        original_edit_message_text = Bot.edit_message_text
+
+        async def send_message_hook(self, *args, **kwargs):
+            if kwargs.get("reply_markup") is None:
+                kwargs["reply_markup"] = back_button()
+            result = await original_send_message(self, *args, **kwargs)
+            _track_interactive_message(result)
+            return result
+
+        async def edit_message_text_hook(self, *args, **kwargs):
+            if kwargs.get("reply_markup") is None:
+                kwargs["reply_markup"] = back_button()
+            result = await original_edit_message_text(self, *args, **kwargs)
+            if kwargs.get("reply_markup") is not None:
+                chat_id = kwargs.get("chat_id")
+                message_id = kwargs.get("message_id")
+                if chat_id is not None and message_id is not None:
+                    LATEST_INTERACTIVE_MESSAGE[chat_id] = message_id
+            return result
+
+        Bot.send_message = send_message_hook
+        Bot.edit_message_text = edit_message_text_hook
+        Bot._ui_tracking_hook = True
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
 def main():
+    _install_ui_hooks()
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN در ابتدای فایل تنظیم نشده است.")
 
