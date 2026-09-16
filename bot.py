@@ -827,7 +827,7 @@ async def get_account_menu(update, context):
 
     await tracked_edit(query, context, 
         "💰 *دریافت حساب*\n\n"
-        "مبلغ موردنظر را به تومان وارد کنید.\n\n"
+        "مبلغ موردنظر را به میلیون تومان وارد کنید.\n\n"
         "مثال:\n"
         "`11.5`",
         parse_mode=ParseMode.MARKDOWN,
@@ -862,7 +862,7 @@ async def receive_amount(update, context):
     context.user_data["reservation_name"] = True
 
     await tracked_reply(update, context, 
-        "👤 لطفاً *نام و نام خانوادگی* خود را برای ثبت رزرو وارد کنید:\n\n"
+        "👤 لطفاً *نام و نام خانوادگی* مشتری خود را برای ثبت رزرو وارد کنید:\n\n"
         "مثال: `علی رضایی`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
