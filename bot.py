@@ -56,6 +56,49 @@ AMOUNT_MULTIPLIER = 1_000_000
 REMINDER_INTERVAL_SECONDS = 3600
 REMINDER_AFTER_HOURS = 24
 
+# شناسه آخرین پیام تعاملی هر کاربر؛ برای بی‌اثر کردن دکمه‌های پیام‌های قدیمی
+LATEST_MESSAGE_IDS = {}
+
+
+async def tracked_reply(update, context, text, **kwargs):
+    # اگر پیام دکمه مشخصی ندارد، یک مسیر برگشت به منوی اصلی اضافه می‌کنیم.
+    kwargs.setdefault("reply_markup", back_button())
+    message = await update.message.reply_text(text, **kwargs)
+    user = update.effective_user
+    if user and message:
+        LATEST_MESSAGE_IDS[user.id] = message.message_id
+    return message
+
+
+async def tracked_send_message(bot, chat_id, *args, **kwargs):
+    message = await bot.send_message(chat_id, *args, **kwargs)
+    LATEST_MESSAGE_IDS[chat_id] = message.message_id
+    return message
+
+
+async def tracked_send_photo(bot, chat_id, *args, **kwargs):
+    message = await bot.send_photo(chat_id, *args, **kwargs)
+    LATEST_MESSAGE_IDS[chat_id] = message.message_id
+    return message
+
+
+async def tracked_send_document(bot, chat_id, *args, **kwargs):
+    message = await bot.send_document(chat_id, *args, **kwargs)
+    LATEST_MESSAGE_IDS[chat_id] = message.message_id
+    return message
+
+
+async def tracked_edit(query, context, text, **kwargs):
+    # اگر کیبورد مشخص نشده، حداقل دکمه بازگشت به منوی اصلی را نگه می‌داریم.
+    kwargs.setdefault("reply_markup", back_button())
+    message = await query.edit_message_text(text, **kwargs)
+    user = query.from_user
+    if user and query.message:
+        LATEST_MESSAGE_IDS[user.id] = query.message.message_id
+    elif user and message:
+        LATEST_MESSAGE_IDS[user.id] = message.message_id
+    return message
+
 
 # =========================================================
 # LOGGING
@@ -67,42 +110,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-# شناسه آخرین پیام تعاملی هر کاربر؛ برای جلوگیری از استفاده از دکمه‌های پیام‌های قدیمی
-LATEST_INTERACTIVE_MESSAGE = {}
-
-
-def _track_interactive_message(message):
-    if message is not None and getattr(message, "reply_markup", None):
-        LATEST_INTERACTIVE_MESSAGE[message.chat_id] = message.message_id
-
-
-# رنگ واقعی برای دکمه‌های تلگرام توسط Bot API پشتیبانی نمی‌شود؛
-# بنابراین از ایموجی‌های رنگی برای ظاهر یکدست و زیبا استفاده می‌کنیم.
-BUTTON_COLOR_MAP = {
-    "دریافت حساب": "🔵", "درخواست‌های من": "🟣", "ارسال فیش": "🟠",
-    "راهنما": "🔷", "افزودن حساب": "🟢", "وضعیت حساب‌ها": "🔵",
-    "در انتظار واریز": "🟡", "فیش‌های در انتظار تایید": "🟠",
-    "فیش‌های دریافتی": "🟣", "تاریخچه": "🟪", "پنل کاربر": "⚪",
-    "رد شده ها": "🔴", "تایید شده ها": "🟢", "لغو شده ها": "⚫",
-    "در انتظار حساب": "🟡", "در انتظار تایید فیش": "🟠",
-    "تأیید": "🟢", "رد": "🔴", "ادامه": "🟢", "لغو درخواست": "🔴",
-    "بازگشت": "◀️", "منوی اصلی": "🏠",
-}
-
-def colored_button_text(text):
-    # اگر از قبل ایموجی رنگی/عملیاتی دارد، دوباره چیزی اضافه نکن.
-    stripped = text.strip()
-    if not stripped:
-        return text
-    for prefix in BUTTON_COLOR_MAP.values():
-        if stripped.startswith(prefix):
-            return text
-    for key, prefix in BUTTON_COLOR_MAP.items():
-        if stripped == key or stripped.endswith(key):
-            return text.replace(key, prefix + " " + key, 1)
-    return text
-
 
 
 # =========================================================
@@ -475,23 +482,23 @@ def user_menu():
             InlineKeyboardButton(
                 "💰 دریافت حساب",
                 callback_data="u_get",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "📋 درخواست‌های من",
                 callback_data="u_requests",
-            ),
+             style="primary"),
             InlineKeyboardButton(
                 "🧾 ارسال فیش",
                 callback_data="u_receipt",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "ℹ️ راهنما",
                 callback_data="u_help",
-            ),
+             style="primary"),
         ],
     ])
 
@@ -502,29 +509,29 @@ def a_content_menu():
             InlineKeyboardButton(
                 "💰 دریافت حساب",
                 callback_data="u_get",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "📋 درخواست‌های من",
                 callback_data="u_requests",
-            ),
+             style="primary"),
             InlineKeyboardButton(
                 "🧾 ارسال فیش",
                 callback_data="u_receipt",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "🧾 فیش‌های دریافتی",
                 callback_data="c_receipts",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "ℹ️ راهنما",
                 callback_data="u_help",
-            ),
+             style="primary"),
         ],
     ])
 
@@ -535,35 +542,35 @@ def admin_menu():
             InlineKeyboardButton(
                 "➕ افزودن حساب",
                 callback_data="a_add",
-            ),
+             style="success"),
         ],
         [
             InlineKeyboardButton(
                 "📊 وضعیت حساب‌ها",
                 callback_data="a_status",
-            ),
+             style="primary"),
             InlineKeyboardButton(
                 "⏳ در انتظار واریز",
                 callback_data="a_payment_pending",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "🧾 فیش‌های در انتظار تایید",
                 callback_data="a_pending",
-            ),
+             style="success"),
         ],
         [
             InlineKeyboardButton(
                 "📜 تاریخچه",
                 callback_data="a_history",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "👤 پنل کاربر",
                 callback_data="u_panel",
-            ),
+             style="primary"),
         ],
     ])
 
@@ -572,9 +579,9 @@ def back_button():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "🏠 منوی اصلی",
+                "⬅️ بازگشت",
                 callback_data="main",
-            ),
+             style="primary"),
         ],
     ])
 
@@ -589,39 +596,39 @@ def requests_status_menu():
             InlineKeyboardButton(
                 "🔴 رد شده ها",
                 callback_data="ur_rejected",
-            ),
+             style="danger"),
             InlineKeyboardButton(
                 "🟢 تایید شده ها",
                 callback_data="ur_paid",
-            ),
+             style="success"),
         ],
         [
             InlineKeyboardButton(
                 "⚫ لغو شده ها",
                 callback_data="ur_cancelled",
-            ),
+             style="danger"),
         ],
         [
             InlineKeyboardButton(
                 "⏳ در انتظار حساب",
                 callback_data="ur_waiting",
-            ),
+             style="primary"),
             InlineKeyboardButton(
                 "💳 در انتظار واریز",
                 callback_data="ur_payment_pending",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "🧾 در انتظار تایید فیش",
                 callback_data="ur_reserved",
-            ),
+             style="success"),
         ],
         [
             InlineKeyboardButton(
-                "🏠 منوی اصلی",
+                "⬅️ بازگشت",
                 callback_data="main",
-            ),
+             style="primary"),
         ],
     ])
 
@@ -632,39 +639,39 @@ def requests_status_keyboard():
             InlineKeyboardButton(
                 "🔴 رد شده ها",
                 callback_data="ur_rejected",
-            ),
+             style="danger"),
             InlineKeyboardButton(
                 "🟢 تایید شده ها",
                 callback_data="ur_paid",
-            ),
+             style="success"),
         ],
         [
             InlineKeyboardButton(
                 "⚫ لغو شده ها",
                 callback_data="ur_cancelled",
-            ),
+             style="danger"),
         ],
         [
             InlineKeyboardButton(
                 "⏳ در انتظار حساب",
                 callback_data="ur_waiting",
-            ),
+             style="primary"),
             InlineKeyboardButton(
                 "💳 در انتظار واریز",
                 callback_data="ur_payment_pending",
-            ),
+             style="primary"),
         ],
         [
             InlineKeyboardButton(
                 "🧾 در انتظار تایید فیش",
                 callback_data="ur_reserved",
-            ),
+             style="success"),
         ],
         [
             InlineKeyboardButton(
                 "⬅️ بازگشت",
                 callback_data="u_requests",
-            ),
+             style="primary"),
         ],
     ])
 
@@ -722,7 +729,7 @@ async def show_main_menu(
             reply_markup=keyboard,
         )
     else:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard,
@@ -738,14 +745,14 @@ async def command_adpass(update, context):
 
     # این مسیر فقط برای کاربر عادی است و هیچ دکمه‌ای برای آن وجود ندارد.
     if is_staff(user.id):
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "ℹ️ شما در حال حاضر دسترسی مدیریتی دارید."
         )
         return
 
     if not ADPASS_PASSWORD:
         logger.error("ADPASS_PASSWORD is not configured")
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ قابلیت ارتقای ادمین در حال حاضر تنظیم نشده است."
         )
         return
@@ -753,7 +760,7 @@ async def command_adpass(update, context):
     clear_state(context)
     context.user_data["adpass_password"] = True
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "🔐 لطفاً رمز عبور مدیریت را وارد کنید:\n\n"
         "⚠️ رمز را فقط در همین گفت‌وگو ارسال کنید."
     )
@@ -767,7 +774,7 @@ async def receive_adpass_password(update, context):
     context.user_data.pop("adpass_password", None)
 
     if not ADPASS_PASSWORD or password != ADPASS_PASSWORD:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ رمز عبور اشتباه است. دسترسی مدیریت فعال نشد."
         )
         return True
@@ -775,7 +782,7 @@ async def receive_adpass_password(update, context):
     user_id = update.effective_user.id
     promote_to_admin(user_id)
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "✅ رمز صحیح است.\n\n"
         "🔐 دسترسی ادمین برای حساب شما فعال شد.\n"
         "از این به بعد منوی مدیریت را مشاهده خواهید کرد."
@@ -811,7 +818,7 @@ async def get_account_menu(update, context):
 
     context.user_data["amount"] = True
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "💰 *دریافت حساب*\n\n"
         "مبلغ موردنظر را به تومان وارد کنید.\n\n"
         "مثال:\n"
@@ -830,7 +837,7 @@ async def receive_amount(update, context):
     )
 
     if amount is None:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ مبلغ نامعتبر است.\n\n"
             "مثال:\n"
             "`11.5`",
@@ -847,7 +854,7 @@ async def receive_amount(update, context):
     context.user_data["pending_amount"] = amount
     context.user_data["reservation_name"] = True
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "👤 لطفاً *نام و نام خانوادگی* خود را برای ثبت رزرو وارد کنید:\n\n"
         "مثال: `علی رضایی`",
         parse_mode=ParseMode.MARKDOWN,
@@ -861,7 +868,7 @@ async def receive_reservation_name(update, context):
 
     name = (update.message.text or "").strip()
     if len(name) < 2 or len(name) > 100:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ نام واردشده معتبر نیست. لطفاً نام و نام خانوادگی را وارد کنید."
         )
         return
@@ -870,7 +877,7 @@ async def receive_reservation_name(update, context):
     context.user_data.pop("reservation_name", None)
 
     if amount is None:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ اطلاعات مبلغ پیدا نشد. لطفاً دوباره از گزینه «دریافت حساب» شروع کنید.",
             reply_markup=user_menu(),
         )
@@ -969,7 +976,7 @@ async def create_request(
 
         conn.close()
 
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "✅ *حساب برای شما اختصاص داده شد*\n\n"
             f"🆔 درخواست: `{request_id}`\n\n"
             f"👤 صاحب حساب:\n"
@@ -987,19 +994,19 @@ async def create_request(
                     InlineKeyboardButton(
                         "🧾 ارسال فیش",
                         callback_data=f"r_{request_id}",
-                    ),
+                     style="primary"),
                 ],
                 [
                     InlineKeyboardButton(
                         "📋 درخواست‌های من",
                         callback_data="u_requests",
-                    ),
+                     style="primary"),
                 ],
                 [
                     InlineKeyboardButton(
                         "⬅️ منوی اصلی",
                         callback_data="main",
-                    ),
+                     style="primary"),
                 ],
             ]),
         )
@@ -1056,7 +1063,7 @@ async def create_request(
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "⏳ *درخواست شما در صف انتظار قرار گرفت*\n\n"
         f"🆔 درخواست: `{request_id}`\n"
         f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\n"
@@ -1082,7 +1089,7 @@ async def create_request(
 
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(
+            await tracked_send_message(context.bot, 
                 admin_id,
                 admin_text,
                 parse_mode=ParseMode.MARKDOWN,
@@ -1102,7 +1109,7 @@ async def my_requests_menu(update, context):
 
     clear_state(context)
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "📋 *درخواست‌های من*\n\n"
         "لطفاً وضعیت درخواست‌ها را انتخاب کنید:",
         parse_mode=ParseMode.MARKDOWN,
@@ -1208,7 +1215,7 @@ async def my_requests_by_status(
 
         text = "\n".join(parts)
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         text,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=requests_status_keyboard(),
@@ -1239,7 +1246,7 @@ async def receipt_menu(update, context):
     conn.close()
 
     if not rows:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "🧾 *ارسال فیش*\n\n"
             "❌ هیچ رزروی که هنوز فیش آن ارسال نشده باشد پیدا نشد.",
             parse_mode=ParseMode.MARKDOWN,
@@ -1254,12 +1261,12 @@ async def receipt_menu(update, context):
             InlineKeyboardButton(
                 f"🧾 #{row['id']} | {name} | {fmt_amount(row['amount'])} تومان",
                 callback_data=f"receipt_select_{row['id']}",
-            )
+             style="primary")
         ])
 
-    keyboard.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main", style="primary")])
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "🧾 *ارسال فیش*\n\n"
         "یکی از رزروهای بدون فیش را انتخاب کنید:",
         parse_mode=ParseMode.MARKDOWN,
@@ -1282,14 +1289,14 @@ async def receipt_select(update, context, request_id):
     conn.close()
 
     if not request:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ این رزرو پیدا نشد.",
             reply_markup=back_button(),
         )
         return
 
     if request["status"] != "reserved" or request["receipt_file_id"]:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ این رزرو دیگر برای ارسال فیش قابل انتخاب نیست.",
             reply_markup=back_button(),
         )
@@ -1298,7 +1305,7 @@ async def receipt_select(update, context, request_id):
     context.user_data["receipt_request"] = request_id
 
     name = request["reservation_name"] or request["first_name"] or "-"
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "📎 *ارسال فیش*\n\n"
         f"🆔 درخواست: `{request_id}`\n"
         f"👤 نام رزرو: {name}\n"
@@ -1352,7 +1359,7 @@ async def receive_receipt(
     if request["status"] != "reserved" or request["receipt_file_id"]:
         conn.close()
         context.user_data.pop("receipt_request", None)
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ این درخواست دیگر آماده دریافت فیش نیست."
         )
         return
@@ -1379,7 +1386,7 @@ async def receive_receipt(
         None,
     )
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "✅ *فیش دریافت شد.*\n\n"
         f"🆔 درخواست: `{request_id}`\n\n"
         "⏳ برای بررسی ارسال شد.",
@@ -1392,11 +1399,11 @@ async def receive_receipt(
             InlineKeyboardButton(
                 "✅ تأیید",
                 callback_data=f"ok_{request_id}",
-            ),
+             style="success"),
             InlineKeyboardButton(
                 "❌ رد",
                 callback_data=f"no_{request_id}",
-            ),
+             style="danger"),
         ],
     ])
 
@@ -1410,7 +1417,7 @@ async def receive_receipt(
 
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(
+            await tracked_send_message(context.bot, 
                 admin_id,
                 admin_text,
                 parse_mode=ParseMode.MARKDOWN,
@@ -1418,13 +1425,13 @@ async def receive_receipt(
             )
 
             if receipt_type == "photo":
-                await context.bot.send_photo(
+                await tracked_send_photo(context.bot, 
                     admin_id,
                     file_id,
                     caption=f"🧾 فیش #{request_id}",
                 )
             else:
-                await context.bot.send_document(
+                await tracked_send_document(context.bot, 
                     admin_id,
                     file_id,
                     caption=f"🧾 فیش #{request_id}",
@@ -1436,20 +1443,20 @@ async def receive_receipt(
     # A Content هم همان فیش را دریافت می‌کند.
     if not is_admin(A_CONTENT_ID):
         try:
-            await context.bot.send_message(
+            await tracked_send_message(context.bot, 
                 A_CONTENT_ID,
                 admin_text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
             )
             if receipt_type == "photo":
-                await context.bot.send_photo(
+                await tracked_send_photo(context.bot, 
                     A_CONTENT_ID,
                     file_id,
                     caption=f"🧾 فیش #{request_id}",
                 )
             else:
-                await context.bot.send_document(
+                await tracked_send_document(context.bot, 
                     A_CONTENT_ID,
                     file_id,
                     caption=f"🧾 فیش #{request_id}",
@@ -1481,7 +1488,7 @@ async def a_content_receipts(update, context):
     conn.close()
 
     if not rows:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "🧾 *فیش‌های دریافتی*\n\n"
             "فعلاً فیشی برای بررسی وجود ندارد.",
             parse_mode=ParseMode.MARKDOWN,
@@ -1495,11 +1502,11 @@ async def a_content_receipts(update, context):
             InlineKeyboardButton(
                 f"🧾 #{row['id']} | {fmt_amount(row['amount'])}",
                 callback_data=f"c_receipt_{row['id']}",
-            )
+             style="primary")
         ])
-    keyboard.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main", style="primary")])
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "🧾 *فیش‌های دریافتی*\n\nیک فیش را برای بررسی انتخاب کنید:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1523,7 +1530,7 @@ async def a_content_receipt_item(update, context, request_id):
     conn.close()
 
     if not row:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ این فیش پیدا نشد یا قبلاً بررسی شده است.",
             reply_markup=back_button(),
         )
@@ -1538,27 +1545,27 @@ async def a_content_receipt_item(update, context, request_id):
         f"💰 `{fmt_amount(row['amount'])}` تومان"
     )
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         text,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ تأیید", callback_data=f"ok_{request_id}"),
-                InlineKeyboardButton("❌ رد", callback_data=f"no_{request_id}"),
+                InlineKeyboardButton("✅ تأیید", callback_data=f"ok_{request_id}", style="success"),
+                InlineKeyboardButton("❌ رد", callback_data=f"no_{request_id}", style="danger"),
             ],
-            [InlineKeyboardButton("⬅️ برگشت", callback_data="c_receipts")],
+            [InlineKeyboardButton("⬅️ برگشت", callback_data="c_receipts", style="primary")],
         ]),
     )
 
     try:
         if row['receipt_type'] == 'photo':
-            await context.bot.send_photo(
+            await tracked_send_photo(context.bot, 
                 query.from_user.id,
                 row['receipt_file_id'],
                 caption=f"🧾 فیش درخواست #{request_id}",
             )
         else:
-            await context.bot.send_document(
+            await tracked_send_document(context.bot, 
                 query.from_user.id,
                 row['receipt_file_id'],
                 caption=f"🧾 فیش درخواست #{request_id}",
@@ -1640,7 +1647,7 @@ async def approve(update, context, request_id):
         pass
 
     try:
-        await context.bot.send_message(
+        await tracked_send_message(context.bot, 
             request["user_id"],
             "✅ *پرداخت تأیید شد*\n\n"
             f"🆔 `{request_id}`\n"
@@ -1721,7 +1728,7 @@ async def reject(update, context, request_id):
         pass
 
     try:
-        await context.bot.send_message(
+        await tracked_send_message(context.bot, 
             request["user_id"],
             "❌ *پرداخت رد شد*\n\n"
             f"🆔 `{request_id}`\n"
@@ -1762,7 +1769,7 @@ async def admin_status(update, context):
     conn.close()
 
     if not rows:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "📊 *وضعیت حساب‌ها*\n\nهیچ حسابی وجود ندارد.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_button(),
@@ -1792,25 +1799,25 @@ async def admin_status(update, context):
             InlineKeyboardButton(
                 f"👥 رزروهای حساب #{row['id']}",
                 callback_data=f"a_target_reservations_{row['id']}",
-            )
+             style="primary")
         ])
         if row["active"]:
             keyboard.append([
                 InlineKeyboardButton(
                     "✏️ تغییر شماره حساب",
                     callback_data=f"a_target_edit_{row['id']}",
-                ),
+                 style="primary"),
                 InlineKeyboardButton(
                     "🗑 حذف حساب",
                     callback_data=f"a_target_delete_{row['id']}",
-                ),
+                 style="danger"),
             ])
 
     keyboard.append([
-        InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")
+        InlineKeyboardButton("⬅️ بازگشت", callback_data="main", style="primary")
     ])
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "\n".join(parts),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1844,7 +1851,7 @@ async def admin_target_reservations(update, context, target_id):
     conn.close()
 
     if not target:
-        await query.edit_message_text("❌ حساب پیدا نشد.", reply_markup=back_button())
+        await tracked_edit(query, context, "❌ حساب پیدا نشد.", reply_markup=back_button())
         return
 
     if not rows:
@@ -1881,12 +1888,12 @@ async def admin_target_reservations(update, context, target_id):
             )
         text = "\n".join(parts)
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         text,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status")],
-            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
+            [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status", style="primary")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
         ]),
     )
 
@@ -1906,7 +1913,7 @@ async def admin_edit_target_start(update, context, target_id):
     conn.close()
 
     if not target:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ این حساب پیدا نشد یا قبلاً حذف شده است.",
             reply_markup=back_button(),
         )
@@ -1915,7 +1922,7 @@ async def admin_edit_target_start(update, context, target_id):
     clear_state(context)
     context.user_data["edit_target_id"] = target_id
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "✏️ *تغییر شماره حساب*\n\n"
         f"🆔 حساب: `{target['id']}`\n"
         f"🏦 شماره فعلی: `{target['account_number']}`\n\n"
@@ -1936,7 +1943,7 @@ async def process_edit_target(update, context):
 
     new_account = (update.message.text or "").strip()
     if not new_account or len(new_account) < 4 or len(new_account) > 100:
-        await update.message.reply_text("❌ شماره حساب نامعتبر است. دوباره وارد کنید.", reply_markup=back_button())
+        await tracked_reply(update, context, "❌ شماره حساب نامعتبر است. دوباره وارد کنید.")
         return
 
     conn = db()
@@ -1948,7 +1955,7 @@ async def process_edit_target(update, context):
         conn.rollback()
         conn.close()
         clear_state(context)
-        await update.message.reply_text("❌ حساب پیدا نشد یا غیرفعال شده است.", reply_markup=admin_menu())
+        await tracked_reply(update, context, "❌ حساب پیدا نشد یا غیرفعال شده است.", reply_markup=admin_menu())
         return
 
     old_account = target["account_number"]
@@ -1956,7 +1963,7 @@ async def process_edit_target(update, context):
         conn.rollback()
         conn.close()
         clear_state(context)
-        await update.message.reply_text("ℹ️ شماره حساب تغییری نکرد.", reply_markup=admin_menu())
+        await tracked_reply(update, context, "ℹ️ شماره حساب تغییری نکرد.", reply_markup=admin_menu())
         return
 
     conn.execute(
@@ -1975,7 +1982,7 @@ async def process_edit_target(update, context):
     conn.close()
     clear_state(context)
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "✅ *شماره حساب تغییر کرد*\n\n"
         f"🆔 حساب: `{target_id}`\n"
         f"🏦 قبلی: `{old_account}`\n"
@@ -1987,7 +1994,7 @@ async def process_edit_target(update, context):
 
     for row in affected:
         try:
-            await context.bot.send_message(
+            await tracked_send_message(context.bot, 
                 row["user_id"],
                 "⚠️ *اطلاعیه تغییر شماره حساب*\n\n"
                 f"🆔 درخواست: `{row['id']}`\n"
@@ -2014,7 +2021,7 @@ async def admin_delete_target(update, context, target_id):
     ).fetchone()
     if not target:
         conn.close()
-        await query.edit_message_text("❌ حساب پیدا نشد یا قبلاً حذف شده است.", reply_markup=back_button())
+        await tracked_edit(query, context, "❌ حساب پیدا نشد یا قبلاً حذف شده است.", reply_markup=back_button())
         return
 
     pending_receipt = conn.execute("""
@@ -2027,19 +2034,19 @@ async def admin_delete_target(update, context, target_id):
     conn.close()
 
     if pending_receipt:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "⚠️ *حذف حساب انجام نشد*\n\n"
             f"برای این حساب `{pending_receipt}` درخواست وجود دارد که فیش آن ارسال شده ولی هنوز بررسی نشده است.\n\n"
             "ابتدا فیش‌های آن حساب را بررسی کنید، سپس حساب را حذف کنید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧾 فیش‌های در انتظار تایید", callback_data="a_pending")],
-                [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status")],
+                [InlineKeyboardButton("🧾 فیش‌های در انتظار تایید", callback_data="a_pending", style="success")],
+                [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status", style="primary")],
             ]),
         )
         return
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "⚠️ *تأیید حذف حساب*\n\n"
         f"🆔 `{target['id']}`\n"
         f"👤 {target['owner_name']}\n"
@@ -2048,8 +2055,8 @@ async def admin_delete_target(update, context, target_id):
         "تاریخچه درخواست‌ها حذف نمی‌شود.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 بله، حذف شود", callback_data=f"a_target_delete_confirm_{target_id}")],
-            [InlineKeyboardButton("❌ انصراف", callback_data="a_status")],
+            [InlineKeyboardButton("🗑 بله، حذف شود", callback_data=f"a_target_delete_confirm_{target_id}", style="danger")],
+            [InlineKeyboardButton("❌ انصراف", callback_data="a_status", style="danger")],
         ]),
     )
 
@@ -2069,7 +2076,7 @@ async def admin_delete_target_confirm(update, context, target_id):
     if not target:
         conn.rollback()
         conn.close()
-        await query.edit_message_text("❌ حساب پیدا نشد یا قبلاً حذف شده است.", reply_markup=back_button())
+        await tracked_edit(query, context, "❌ حساب پیدا نشد یا قبلاً حذف شده است.", reply_markup=back_button())
         return
 
     pending_receipt = conn.execute("""
@@ -2079,7 +2086,7 @@ async def admin_delete_target_confirm(update, context, target_id):
     if pending_receipt:
         conn.rollback()
         conn.close()
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ حذف متوقف شد؛ هنوز فیش بررسی‌نشده برای این حساب وجود دارد.",
             reply_markup=back_button(),
         )
@@ -2109,7 +2116,7 @@ async def admin_delete_target_confirm(update, context, target_id):
     conn.commit()
     conn.close()
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "✅ *حساب حذف شد*\n\n"
         f"🆔 `{target_id}`\n"
         f"🏦 `{target['account_number']}`\n"
@@ -2121,7 +2128,7 @@ async def admin_delete_target_confirm(update, context, target_id):
 
     for row in affected:
         try:
-            await context.bot.send_message(
+            await tracked_send_message(context.bot, 
                 row["user_id"],
                 "⚠️ *اطلاعیه حذف شماره حساب*\n\n"
                 f"🆔 درخواست: `{row['id']}`\n"
@@ -2158,7 +2165,7 @@ async def admin_payment_pending(update, context):
     conn.close()
 
     if not rows:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "💳 *درخواست‌های در انتظار واریز*\n\n"
             "هیچ درخواستی در انتظار واریز نیست.",
             parse_mode=ParseMode.MARKDOWN,
@@ -2172,14 +2179,14 @@ async def admin_payment_pending(update, context):
             InlineKeyboardButton(
                 f"💳 #{row['id']} | {row['reservation_name'] or row['first_name'] or '-'} | {fmt_amount(row['amount'])}",
                 callback_data=f"pp_{row['id']}",
-            )
+             style="primary")
         ])
 
     keyboard.append([
-        InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")
+        InlineKeyboardButton("⬅️ بازگشت", callback_data="main", style="primary")
     ])
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "💳 *درخواست‌های در انتظار واریز*\n\n"
         "این افراد حساب گرفته‌اند ولی هنوز فیش ارسال نکرده‌اند:",
         parse_mode=ParseMode.MARKDOWN,
@@ -2204,7 +2211,7 @@ async def admin_payment_pending_item(update, context, request_id):
     conn.close()
 
     if not row:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ درخواست پیدا نشد یا فیش آن ارسال شده است.",
             reply_markup=back_button(),
         )
@@ -2221,12 +2228,12 @@ async def admin_payment_pending_item(update, context, request_id):
         "⚠️ هنوز فیش ارسال نشده است."
     )
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         text,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ برگشت", callback_data="a_payment_pending")],
-            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
+            [InlineKeyboardButton("⬅️ برگشت", callback_data="a_payment_pending", style="primary")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
         ]),
     )
 
@@ -2259,7 +2266,7 @@ async def admin_pending(update, context):
     conn.close()
 
     if not rows:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "⏳ *پرداخت‌های در انتظار*\n\n"
             "هیچ پرداختی وجود ندارد.",
             parse_mode=ParseMode.MARKDOWN,
@@ -2281,17 +2288,17 @@ async def admin_pending(update, context):
                 f"{icon} #{row['id']} | "
                 f"{fmt_amount(row['amount'])}",
                 callback_data=f"p_{row['id']}",
-            ),
+             style="primary"),
         ])
 
     keyboard.append([
         InlineKeyboardButton(
             "⬅️ بازگشت",
             callback_data="main",
-        ),
+         style="primary"),
     ])
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "⏳ *پرداخت‌های در انتظار*\n\n"
         "یک مورد را انتخاب کنید:",
         parse_mode=ParseMode.MARKDOWN,
@@ -2324,7 +2331,7 @@ async def pending_item(
     conn.close()
 
     if not row:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ درخواست پیدا نشد.",
             reply_markup=back_button(),
         )
@@ -2352,21 +2359,21 @@ async def pending_item(
             InlineKeyboardButton(
                 "✅ تأیید",
                 callback_data=f"ok_{request_id}",
-            ),
+             style="success"),
             InlineKeyboardButton(
                 "❌ رد",
                 callback_data=f"no_{request_id}",
-            ),
+             style="danger"),
         ],
         [
             InlineKeyboardButton(
                 "⬅️ برگشت",
                 callback_data="a_pending",
-            ),
+             style="primary"),
         ],
     ])
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         text,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=keyboard,
@@ -2416,7 +2423,7 @@ async def add_account_menu(
         "new_account"
     ] = True
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "➕ *افزودن حساب*\n\n"
         "فرمت:\n"
         "`نام|شماره‌حساب|سقف|ددلاین`\n\n"
@@ -2443,7 +2450,7 @@ async def process_new_account(
     parts = update.message.text.split("|")
 
     if len(parts) != 4:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ فرمت اشتباه است.\n\n"
             "`نام|شماره‌حساب|سقف|ددلاین`\n\n"
             "ددلاین: `YYYY-MM-DD HH:MM` به وقت ایران",
@@ -2457,31 +2464,31 @@ async def process_new_account(
     deadline_at = parse_deadline(parts[3])
 
     if not owner:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ نام خالی است."
         )
         return
 
     if not account:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ شماره حساب خالی است."
         )
         return
 
     if capacity is None:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ سقف نامعتبر است."
         )
         return
 
     if deadline_at is None:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ ددلاین نامعتبر است.\n\nفرمت صحیح: `YYYY-MM-DD HH:MM` به وقت ایران",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
     if parse_iso(deadline_at) <= datetime.now(timezone.utc):
-        await update.message.reply_text("❌ ددلاین باید در آینده باشد.", reply_markup=back_button())
+        await tracked_reply(update, context, "❌ ددلاین باید در آینده باشد.")
         return
 
     conn = db()
@@ -2503,7 +2510,7 @@ async def process_new_account(
 
     clear_state(context)
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "✅ *حساب اضافه شد*\n\n"
         f"🆔 `{target_id}`\n"
         f"👤 `{owner}`\n"
@@ -2518,7 +2525,7 @@ async def process_new_account(
     # اطلاع کاربران
     for request, target in assigned:
         try:
-            await context.bot.send_message(
+            await tracked_send_message(context.bot, 
                 request["user_id"],
                 "🎉 *حساب برای شما آماده شد!*\n\n"
                 f"🆔 درخواست: `{request['id']}`\n"
@@ -2534,7 +2541,7 @@ async def process_new_account(
                         InlineKeyboardButton(
                             "🧾 ارسال فیش",
                             callback_data="u_receipt",
-                        ),
+                         style="primary"),
                     ],
                 ]),
             )
@@ -2565,7 +2572,7 @@ async def history_menu(update, context):
     conn.close()
 
     if not rows:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "📜 هیچ حسابی وجود ندارد.",
             reply_markup=back_button(),
         )
@@ -2578,17 +2585,17 @@ async def history_menu(update, context):
             InlineKeyboardButton(
                 f"🏦 {row['owner_name']} #{row['id']}",
                 callback_data=f"h_{row['id']}",
-            ),
+             style="primary"),
         ])
 
     keyboard.append([
         InlineKeyboardButton(
             "⬅️ بازگشت",
             callback_data="main",
-        ),
+         style="primary"),
     ])
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "📜 *انتخاب حساب:*",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2630,7 +2637,7 @@ async def history_item(
     conn.close()
 
     if not target:
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ حساب پیدا نشد.",
             reply_markup=back_button(),
         )
@@ -2667,7 +2674,7 @@ async def history_item(
                 f"{status_names.get(row['status'], row['status'])}"
             )
 
-    await query.edit_message_text(
+    await tracked_edit(query, context, 
         "\n".join(parts),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
@@ -2685,15 +2692,22 @@ async def callback_router(
     query = update.callback_query
     data = query.data
 
-    # فقط دکمه‌های آخرین پیام تعاملی معتبر هستند.
-    # این کار جلوی کلیک روی دکمه‌های پیام‌های قبلی را می‌گیرد.
-    latest_message_id = LATEST_INTERACTIVE_MESSAGE.get(query.from_user.id)
-    if latest_message_id is not None and query.message and query.message.message_id != latest_message_id:
-        try:
-            await query.answer("⚠️ لطفاً از آخرین پیام استفاده کنید.", show_alert=True)
-        except Exception:
-            pass
-        return
+    # فقط دکمه‌های آخرین پیام قابل استفاده‌اند.
+    # با این کار کلیک روی دکمه‌های پیام‌های قدیمی یک خطای واضح نشان می‌دهد.
+    if query.message is not None:
+        user_id = query.from_user.id
+        latest_message_id = LATEST_MESSAGE_IDS.get(user_id)
+        if latest_message_id is None:
+            LATEST_MESSAGE_IDS[user_id] = query.message.message_id
+        elif query.message.message_id != latest_message_id:
+            try:
+                await query.answer(
+                    "لطفاً از آخرین پیام استفاده کنید",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
 
     # -----------------------------------------------------
     # جواب فوری به Telegram
@@ -2723,7 +2737,7 @@ async def callback_router(
     if data == "u_panel":
         clear_state(context)
 
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "👤 *پنل کاربر*\n\n"
             "گزینه موردنظر را انتخاب کنید.",
             parse_mode=ParseMode.MARKDOWN,
@@ -2846,7 +2860,7 @@ async def callback_router(
 
     if data == "u_help":
 
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "ℹ️ *راهنما*\n\n"
             "💰 مبلغ را وارد کنید تا حساب مناسب اختصاص داده شود.\n\n"
             "🧾 پس از پرداخت، فیش را ارسال کنید.\n\n"
@@ -2975,18 +2989,17 @@ async def callback_router(
         conn.close()
 
         if not row or row['status'] != 'reserved' or row['receipt_file_id']:
-            await query.edit_message_text("❌ این درخواست دیگر در انتظار واریز نیست.")
+            await tracked_edit(query, context, "❌ این درخواست دیگر در انتظار واریز نیست.")
             return
 
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "▶️ *ادامه پرداخت*\n\n"
             f"🆔 درخواست: `{request_id}`\n"
             "درخواست شما فعال ماند. پس از پرداخت، فیش را ارسال کنید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧾 ارسال فیش", callback_data="u_receipt")],
-                [InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests")],
-                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
+                [InlineKeyboardButton("🧾 ارسال فیش", callback_data=f"r_{request_id}", style="primary")],
+                [InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests", style="primary")],
             ]),
         )
         return
@@ -3005,7 +3018,7 @@ async def callback_router(
 
         if not row or row['status'] != 'reserved' or row['receipt_file_id']:
             conn.close()
-            await query.edit_message_text("❌ این درخواست دیگر قابل لغو نیست.")
+            await tracked_edit(query, context, "❌ این درخواست دیگر قابل لغو نیست.")
             return
 
         conn.execute("""
@@ -3026,7 +3039,7 @@ async def callback_router(
         conn.commit()
         conn.close()
 
-        await query.edit_message_text(
+        await tracked_edit(query, context, 
             "❌ *درخواست لغو شد*\n\n"
             f"🆔 درخواست: `{request_id}`\n"
             "رزرو این درخواست آزاد شد.",
@@ -3036,7 +3049,7 @@ async def callback_router(
 
         for admin_id in ADMIN_IDS:
             try:
-                await context.bot.send_message(
+                await tracked_send_message(context.bot, 
                     admin_id,
                     f"❌ درخواست `{request_id}` توسط کاربر لغو شد.",
                     parse_mode=ParseMode.MARKDOWN,
@@ -3135,7 +3148,7 @@ async def command_getaccount(
     context,
 ):
     if not context.args:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "مثال:\n"
             "`/getaccount 11.5`",
             parse_mode=ParseMode.MARKDOWN,
@@ -3147,7 +3160,7 @@ async def command_getaccount(
     )
 
     if amount is None:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "❌ مبلغ نامعتبر است."
         )
         return
@@ -3155,7 +3168,7 @@ async def command_getaccount(
     context.user_data["pending_amount"] = amount
     context.user_data["reservation_name"] = True
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "👤 لطفاً *نام و نام خانوادگی* خود را برای ثبت رزرو وارد کنید:\n\n"
         "مثال: `علی رضایی`",
         parse_mode=ParseMode.MARKDOWN,
@@ -3182,7 +3195,7 @@ async def command_receipt(update, context):
     conn.close()
 
     if not rows:
-        await update.message.reply_text(
+        await tracked_reply(update, context, 
             "🧾 *ارسال فیش*\\n\\n"
             "❌ هیچ رزروی که هنوز فیش آن ارسال نشده باشد پیدا نشد.",
             parse_mode=ParseMode.MARKDOWN,
@@ -3197,12 +3210,12 @@ async def command_receipt(update, context):
             InlineKeyboardButton(
                 f"🧾 #{row['id']} | {name} | {fmt_amount(row['amount'])} تومان",
                 callback_data=f"receipt_select_{row['id']}",
-            )
+             style="primary")
         ])
 
-    keyboard.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main", style="primary")])
 
-    await update.message.reply_text(
+    await tracked_reply(update, context, 
         "🧾 *ارسال فیش*\\n\\n"
         "یکی از رزروهای بدون فیش را انتخاب کنید:",
         parse_mode=ParseMode.MARKDOWN,
@@ -3254,10 +3267,9 @@ async def text_router(
 async def send_payment_reminder(bot, row):
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("❌ لغو درخواست", callback_data=f"cancel_payment_{row['id']}"),
-            InlineKeyboardButton("▶️ ادامه", callback_data=f"continue_payment_{row['id']}"),
+            InlineKeyboardButton("❌ لغو درخواست", callback_data=f"cancel_payment_{row['id']}", style="danger"),
+            InlineKeyboardButton("▶️ ادامه", callback_data=f"continue_payment_{row['id']}", style="primary"),
         ],
-        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
     ])
 
     text = (
@@ -3269,7 +3281,7 @@ async def send_payment_reminder(bot, row):
         "اگر هنوز قصد پرداخت دارید، «ادامه» را بزنید."
     )
 
-    await bot.send_message(
+    await tracked_send_message(bot, 
         row['user_id'],
         text,
         parse_mode=ParseMode.MARKDOWN,
@@ -3351,67 +3363,10 @@ async def error_handler(
 
 
 # =========================================================
-# UI HOOKS
-# =========================================================
-
-def _install_ui_hooks():
-    # همه دکمه‌های InlineKeyboardButton را با ایموجی رنگی یکدست می‌کنیم.
-    original_button_init = InlineKeyboardButton.__init__
-    if not getattr(InlineKeyboardButton, "_ui_color_hook", False):
-        def button_init(self, text, *args, **kwargs):
-            text = colored_button_text(text)
-            return original_button_init(self, text, *args, **kwargs)
-        InlineKeyboardButton.__init__ = button_init
-        InlineKeyboardButton._ui_color_hook = True
-
-    # پیام‌های دارای کیبورد را به عنوان آخرین پیام تعاملی ثبت می‌کنیم.
-    from telegram import Message, Bot
-    if not getattr(Message, "_ui_tracking_hook", False):
-        original_reply_text = Message.reply_text
-
-        async def reply_text_hook(self, *args, **kwargs):
-            if kwargs.get("reply_markup") is None:
-                kwargs["reply_markup"] = back_button()
-            msg = await original_reply_text(self, *args, **kwargs)
-            _track_interactive_message(msg)
-            return msg
-
-        Message.reply_text = reply_text_hook
-        Message._ui_tracking_hook = True
-
-    if not getattr(Bot, "_ui_tracking_hook", False):
-        original_send_message = Bot.send_message
-        original_edit_message_text = Bot.edit_message_text
-
-        async def send_message_hook(self, *args, **kwargs):
-            if kwargs.get("reply_markup") is None:
-                kwargs["reply_markup"] = back_button()
-            result = await original_send_message(self, *args, **kwargs)
-            _track_interactive_message(result)
-            return result
-
-        async def edit_message_text_hook(self, *args, **kwargs):
-            if kwargs.get("reply_markup") is None:
-                kwargs["reply_markup"] = back_button()
-            result = await original_edit_message_text(self, *args, **kwargs)
-            if kwargs.get("reply_markup") is not None:
-                chat_id = kwargs.get("chat_id")
-                message_id = kwargs.get("message_id")
-                if chat_id is not None and message_id is not None:
-                    LATEST_INTERACTIVE_MESSAGE[chat_id] = message_id
-            return result
-
-        Bot.send_message = send_message_hook
-        Bot.edit_message_text = edit_message_text_hook
-        Bot._ui_tracking_hook = True
-
-
-# =========================================================
 # MAIN
 # =========================================================
 
 def main():
-    _install_ui_hooks()
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN در ابتدای فایل تنظیم نشده است.")
 
