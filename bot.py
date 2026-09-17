@@ -563,26 +563,18 @@ def check_available_amount(target):
 def user_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                "💰 دریافت حساب",
-                callback_data="u_get",
-             style="success"),
+            InlineKeyboardButton("💰 دریافت حساب", callback_data="u_get", style="success"),
+            InlineKeyboardButton("📄 دریافت چک", callback_data="u_check", style="primary"),
         ],
         [
-            InlineKeyboardButton(
-                "📋 درخواست‌های من",
-                callback_data="u_requests",
-             style="primary"),
-            InlineKeyboardButton(
-                "🧾 ارسال فیش",
-                callback_data="u_receipt",
-             style="success"),
+            InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests", style="primary"),
+            InlineKeyboardButton("🧾 ارسال فیش", callback_data="u_receipt", style="success"),
         ],
         [
-            InlineKeyboardButton(
-                "ℹ️ راهنما",
-                callback_data="u_help",
-             style="primary"),
+            InlineKeyboardButton("📑 چک‌های من", callback_data="u_checks", style="success"),
+        ],
+        [
+            InlineKeyboardButton("ℹ️ راهنما", callback_data="u_help", style="primary"),
         ],
     ])
 
@@ -590,32 +582,22 @@ def user_menu():
 def a_content_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                "💰 دریافت حساب",
-                callback_data="u_get",
-             style="success"),
+            InlineKeyboardButton("💰 دریافت حساب", callback_data="u_get", style="success"),
+            InlineKeyboardButton("📄 دریافت چک", callback_data="u_check", style="primary"),
         ],
         [
-            InlineKeyboardButton(
-                "📋 درخواست‌های من",
-                callback_data="u_requests",
-             style="primary"),
-            InlineKeyboardButton(
-                "🧾 ارسال فیش",
-                callback_data="u_receipt",
-             style="success"),
+            InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests", style="primary"),
+            InlineKeyboardButton("🧾 ارسال فیش", callback_data="u_receipt", style="success"),
         ],
         [
-            InlineKeyboardButton(
-                "🧾 فیش‌های دریافتی",
-                callback_data="c_receipts",
-             style="success"),
+            InlineKeyboardButton("📑 چک‌های من", callback_data="u_checks", style="success"),
         ],
         [
-            InlineKeyboardButton(
-                "ℹ️ راهنما",
-                callback_data="u_help",
-             style="primary"),
+            InlineKeyboardButton("🧾 فیش‌های دریافتی", callback_data="c_receipts", style="success"),
+            InlineKeyboardButton("📄 چک‌های در انتظار بررسی", callback_data="c_checks", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("ℹ️ راهنما", callback_data="u_help", style="primary"),
         ],
     ])
 
@@ -623,49 +605,29 @@ def a_content_menu():
 def admin_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                "➕ افزودن حساب",
-                callback_data="a_add",
-             style="success"),
+            InlineKeyboardButton("➕ افزودن حساب", callback_data="a_add", style="success"),
+            InlineKeyboardButton("➕ افزودن چک", callback_data="a_check_add", style="primary"),
         ],
         [
-            InlineKeyboardButton(
-                "📊 وضعیت حساب‌ها",
-                callback_data="a_status",
-             style="primary"),
-            InlineKeyboardButton(
-                "⏳ در انتظار واریز",
-                callback_data="a_payment_pending",
-             style="primary"),
+            InlineKeyboardButton("📊 وضعیت حساب‌ها", callback_data="a_status", style="primary"),
+            InlineKeyboardButton("⏳ در انتظار واریز", callback_data="a_payment_pending", style="primary"),
         ],
         [
-            InlineKeyboardButton(
-                "🧾 فیش‌های در انتظار تایید",
-                callback_data="a_pending",
-             style="success"),
+            InlineKeyboardButton("🧾 فیش‌های در انتظار تایید", callback_data="a_pending", style="success"),
+            InlineKeyboardButton("📄 چک‌های در انتظار تایید", callback_data="a_checks", style="success"),
         ],
         [
-            InlineKeyboardButton(
-                "📜 تاریخچه",
-                callback_data="a_history",
-             style="primary"),
+            InlineKeyboardButton("📜 تاریخچه", callback_data="a_history", style="primary"),
         ],
         [
-            InlineKeyboardButton(
-                "👤 پنل کاربر",
-                callback_data="u_panel",
-             style="primary"),
+            InlineKeyboardButton("👤 پنل کاربر", callback_data="u_panel", style="primary"),
         ],
     ])
 
 
 def back_button():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "⬅️ بازگشت",
-                callback_data="main"),
-        ],
+        [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary")],
     ])
 
 
@@ -1344,7 +1306,7 @@ async def receipt_menu(update, context):
              style="primary")
         ])
 
-    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary")])
 
     await tracked_edit(query, context, 
         "🧾 *ارسال فیش*\n\n"
@@ -1886,7 +1848,7 @@ async def a_content_receipts(update, context):
                 callback_data=f"c_receipt_{row['id']}",
              style="primary")
         ])
-    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary")])
 
     await tracked_edit(query, context, 
         "🧾 *فیش‌های دریافتی*\n\nیک فیش را برای بررسی انتخاب کنید:",
@@ -2196,7 +2158,7 @@ async def admin_status(update, context):
             ])
 
     keyboard.append([
-        InlineKeyboardButton("⬅️ بازگشت", callback_data="main")
+        InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary")
     ])
 
     await tracked_edit(query, context, 
@@ -2274,8 +2236,8 @@ async def admin_target_reservations(update, context, target_id):
         text,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status")],
-            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
+            [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status", style="primary")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
         ]),
     )
 
@@ -2423,7 +2385,7 @@ async def admin_delete_target(update, context, target_id):
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🧾 فیش‌های در انتظار تایید", callback_data="a_pending", style="success")],
-                [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status")],
+                [InlineKeyboardButton("⬅️ وضعیت حساب‌ها", callback_data="a_status", style="primary")],
             ]),
         )
         return
@@ -2565,7 +2527,7 @@ async def admin_payment_pending(update, context):
         ])
 
     keyboard.append([
-        InlineKeyboardButton("⬅️ بازگشت", callback_data="main")
+        InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary")
     ])
 
     await tracked_edit(query, context, 
@@ -2614,8 +2576,8 @@ async def admin_payment_pending_item(update, context, request_id):
         text,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ برگشت", callback_data="a_payment_pending")],
-            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main")],
+            [InlineKeyboardButton("⬅️ در انتظار واریز", callback_data="a_payment_pending", style="primary")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
         ]),
     )
 
@@ -3621,7 +3583,7 @@ async def command_receipt(update, context):
              style="primary")
         ])
 
-    keyboard.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="main")])
+    keyboard.append([InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary")])
 
     await tracked_reply(update, context, 
         "🧾 *ارسال فیش*\\n\\n"
