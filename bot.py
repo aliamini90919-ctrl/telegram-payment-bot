@@ -88,13 +88,16 @@ async def tracked_send_message(bot, chat_id, *args, **kwargs):
 
 async def tracked_send_photo(bot, chat_id, *args, **kwargs):
     message = await bot.send_photo(chat_id, *args, **kwargs)
-    LATEST_MESSAGE_IDS[chat_id] = message.message_id
+    # عکس/فایل بدون دکمه نباید آخرین پیام تعاملی را جابه‌جا کند.
+    if kwargs.get("reply_markup") is not None:
+        LATEST_MESSAGE_IDS[chat_id] = message.message_id
     return message
 
 
 async def tracked_send_document(bot, chat_id, *args, **kwargs):
     message = await bot.send_document(chat_id, *args, **kwargs)
-    LATEST_MESSAGE_IDS[chat_id] = message.message_id
+    if kwargs.get("reply_markup") is not None:
+        LATEST_MESSAGE_IDS[chat_id] = message.message_id
     return message
 
 
@@ -207,6 +210,46 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_targets_active
         ON payment_targets(active);
+
+    CREATE TABLE IF NOT EXISTS check_targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_name TEXT NOT NULL,
+        name_key TEXT NOT NULL,
+        national_id TEXT NOT NULL,
+        capacity INTEGER NOT NULL DEFAULT 0,
+        reserved_amount INTEGER NOT NULL DEFAULT 0,
+        approved_amount INTEGER NOT NULL DEFAULT 0,
+        month INTEGER NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS check_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        requester_name TEXT NOT NULL,
+        requester_name_key TEXT NOT NULL,
+        national_id TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        month INTEGER NOT NULL,
+        target_id INTEGER,
+        owner_name_snapshot TEXT,
+        national_id_snapshot TEXT,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        check_file_id TEXT,
+        check_file_type TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_check_targets_match
+        ON check_targets(active, month, national_id, name_key);
+    CREATE INDEX IF NOT EXISTS idx_check_requests_user
+        ON check_requests(user_id);
+    CREATE INDEX IF NOT EXISTS idx_check_requests_status
+        ON check_requests(status);
 
     CREATE TABLE IF NOT EXISTS promoted_admins (
         user_id INTEGER PRIMARY KEY,
@@ -480,6 +523,37 @@ def available_amount(target):
 
 def clear_state(context):
     context.user_data.clear()
+
+
+def normalize_person_name(value):
+    value = str(value or '').strip().replace('ي', 'ی').replace('ك', 'ک')
+    return ' '.join(value.split()).casefold()
+
+
+def normalize_national_id(value):
+    value = str(value or '').strip()
+    translation = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
+    return value.translate(translation).replace('-', '').replace(' ', '')
+
+
+def parse_month(value):
+    value = str(value or '').strip()
+    translation = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
+    value = value.translate(translation)
+    try:
+        month = int(value)
+        return month if 1 <= month <= 12 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def month_display(month):
+    names = {1:'فروردین',2:'اردیبهشت',3:'خرداد',4:'تیر',5:'مرداد',6:'شهریور',7:'مهر',8:'آبان',9:'آذر',10:'دی',11:'بهمن',12:'اسفند'}
+    return f"ماه {month} ({names.get(month, '-')})"
+
+
+def check_available_amount(target):
+    return max(0, int(target['capacity']) - int(target['reserved_amount']) - int(target['approved_amount']))
 
 
 # =========================================================
@@ -827,7 +901,7 @@ async def get_account_menu(update, context):
 
     await tracked_edit(query, context, 
         "💰 *دریافت حساب*\n\n"
-        "مبلغ موردنظر را به میلیون تومان وارد کنید.\n\n"
+        "مبلغ موردنظر را به تومان وارد کنید.\n\n"
         "مثال:\n"
         "`11.5`",
         parse_mode=ParseMode.MARKDOWN,
@@ -862,7 +936,7 @@ async def receive_amount(update, context):
     context.user_data["reservation_name"] = True
 
     await tracked_reply(update, context, 
-        "👤 لطفاً *نام و نام خانوادگی* مشتری خود را برای ثبت رزرو وارد کنید:\n\n"
+        "👤 لطفاً *نام و نام خانوادگی* خود را برای ثبت رزرو وارد کنید:\n\n"
         "مثال: `علی رضایی`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
@@ -1469,6 +1543,308 @@ async def receive_receipt(
                 )
         except Exception:
             pass
+
+
+# =========================================================
+# CHECK REGISTRATION
+# =========================================================
+
+async def check_start(update, context):
+    query = update.callback_query
+    await query.answer()
+    clear_state(context)
+    context.user_data['check_amount'] = True
+    await tracked_edit(query, context,
+        "🧾 *ثبت چک*\n\nمبلغ چک را به تومان وارد کنید.\nمثال: `200` یعنی ۲۰۰ میلیون تومان.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=back_button())
+
+
+async def receive_check_amount(update, context):
+    if not context.user_data.get('check_amount'):
+        return False
+    amount = parse_amount(update.message.text)
+    if amount is None:
+        await tracked_reply(update, context, "❌ مبلغ نامعتبر است. مثال: `200` یا `200.5`", parse_mode=ParseMode.MARKDOWN)
+        return True
+    context.user_data.pop('check_amount', None)
+    context.user_data['pending_check_amount'] = amount
+    context.user_data['check_name'] = True
+    await tracked_reply(update, context, "👤 نام و نام خانوادگی صاحب چک را وارد کنید:", reply_markup=back_button())
+    return True
+
+
+async def receive_check_name(update, context):
+    if not context.user_data.get('check_name'):
+        return False
+    name = (update.message.text or '').strip()
+    if len(name) < 2 or len(name) > 100:
+        await tracked_reply(update, context, "❌ نام معتبر نیست. لطفاً نام و نام خانوادگی را کامل وارد کنید.")
+        return True
+    context.user_data.pop('check_name', None)
+    context.user_data['pending_check_name'] = name
+    context.user_data['check_national_id'] = True
+    await tracked_reply(update, context, "🔢 کد ملی ۱۰ رقمی را وارد کنید:")
+    return True
+
+
+async def receive_check_national_id(update, context):
+    if not context.user_data.get('check_national_id'):
+        return False
+    national_id = normalize_national_id(update.message.text)
+    if len(national_id) != 10 or not national_id.isdigit():
+        await tracked_reply(update, context, "❌ کد ملی باید دقیقاً ۱۰ رقم باشد. دوباره وارد کنید.")
+        return True
+    context.user_data.pop('check_national_id', None)
+    context.user_data['pending_check_national_id'] = national_id
+    context.user_data['check_month'] = True
+    await tracked_reply(update, context, "📅 ماه سررسید چک را فقط به صورت عدد ۱ تا ۱۲ وارد کنید.\nمثال: `9`", parse_mode=ParseMode.MARKDOWN)
+    return True
+
+
+async def receive_check_month(update, context):
+    if not context.user_data.get('check_month'):
+        return False
+    month = parse_month(update.message.text)
+    if month is None:
+        await tracked_reply(update, context, "❌ ماه نامعتبر است. عددی بین ۱ تا ۱۲ وارد کنید.")
+        return True
+    amount = context.user_data.pop('pending_check_amount', None)
+    name = context.user_data.pop('pending_check_name', None)
+    national_id = context.user_data.pop('pending_check_national_id', None)
+    context.user_data.pop('check_month', None)
+    if amount is None or not name or not national_id:
+        await tracked_reply(update, context, "❌ اطلاعات ثبت چک ناقص شد. لطفاً دوباره از «ثبت چک» شروع کنید.", reply_markup=user_menu())
+        return True
+    await create_check_request(update, context, amount, name, national_id, month)
+    return True
+
+
+async def create_check_request(update, context, amount, name, national_id, month):
+    user = update.effective_user
+    name_key = normalize_person_name(name)
+    conn = db()
+    conn.execute('BEGIN IMMEDIATE')
+    target = conn.execute("""
+        SELECT * FROM check_targets
+        WHERE active = 1 AND month = ? AND national_id = ? AND name_key = ?
+          AND (capacity - reserved_amount - approved_amount) >= ?
+        ORDER BY id ASC LIMIT 1
+    """, (month, national_id, name_key, amount)).fetchone()
+    created = now_iso()
+    if target:
+        cur = conn.execute("""
+            INSERT INTO check_requests (
+                user_id, username, first_name, requester_name, requester_name_key,
+                national_id, amount, month, target_id, owner_name_snapshot,
+                national_id_snapshot, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+        """, (user.id, user.username, user.first_name, name, name_key, national_id,
+              amount, month, target['id'], target['owner_name'], target['national_id'], created, created))
+        request_id = cur.lastrowid
+        conn.execute('UPDATE check_targets SET reserved_amount = reserved_amount + ? WHERE id = ?', (amount, target['id']))
+        conn.commit(); conn.close()
+        await tracked_reply(update, context,
+            "✅ *چک مناسب پیدا شد و برای شما رزرو شد*\n\n"
+            f"🆔 درخواست چک: `{request_id}`\n👤 نام: `{target['owner_name']}`\n"
+            f"🔢 کد ملی: `{target['national_id']}`\n📅 {month_display(month)}\n"
+            f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\nحالا عکس واضح چک را ارسال کنید.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('📷 ارسال عکس چک', callback_data=f'check_select_{request_id}', style='success')],
+                [InlineKeyboardButton('🏠 منوی اصلی', callback_data='main', style='primary')],
+            ]))
+        return
+    cur = conn.execute("""
+        INSERT INTO check_requests (
+            user_id, username, first_name, requester_name, requester_name_key,
+            national_id, amount, month, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)
+    """, (user.id, user.username, user.first_name, name, name_key, national_id, amount, month, created, created))
+    request_id = cur.lastrowid
+    conn.commit(); conn.close()
+    await tracked_reply(update, context,
+        "⏳ *برای این مشخصات فعلاً چکی موجود نیست*\n\n"
+        f"👤 نام: `{name}`\n🔢 کد ملی: `{national_id}`\n📅 {month_display(month)}\n"
+        f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\n"
+        "درخواست شما در صف انتظار ثبت شد. اگر چک مناسب برای همین ماه و همین مشخصات اضافه شود، خودکار به شما اطلاع می‌دهیم.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=user_menu())
+    admin_text = ("🚨 *درخواست جدید ثبت چک*\n\n"
+                  f"🆔 `{request_id}`\n👤 `{name}`\n🔢 `{national_id}`\n"
+                  f"📅 {month_display(month)}\n💰 `{fmt_amount(amount)}` تومان\n\n"
+                  "⚠️ چک مناسب موجود نیست و درخواست در صف انتظار است.")
+    for admin_id in ADMIN_IDS:
+        try:
+            await tracked_send_message(context.bot, admin_id, admin_text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+        except Exception:
+            pass
+
+
+async def check_select(update, context, request_id):
+    query = update.callback_query
+    await query.answer()
+    conn = db()
+    row = conn.execute('SELECT * FROM check_requests WHERE id = ? AND user_id = ?', (request_id, query.from_user.id)).fetchone()
+    conn.close()
+    if not row or row['status'] != 'reserved' or row['check_file_id']:
+        await tracked_edit(query, context, '❌ این درخواست چک دیگر آماده دریافت عکس نیست.', reply_markup=back_button())
+        return
+    context.user_data['check_upload_request'] = request_id
+    await tracked_edit(query, context,
+        "📷 *ارسال عکس چک*\n\n"
+        f"🆔 درخواست: `{request_id}`\n👤 {row['owner_name_snapshot'] or row['requester_name']}\n"
+        f"🔢 کد ملی: `{row['national_id_snapshot'] or row['national_id']}`\n📅 {month_display(row['month'])}\n"
+        f"💰 `{fmt_amount(row['amount'])}` تومان\n\nلطفاً عکس واضح و کامل چک را همینجا ارسال کنید.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=back_button())
+
+
+async def receive_check_image(update, context):
+    request_id = context.user_data.get('check_upload_request')
+    if not request_id:
+        return False
+    user = update.effective_user
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id; file_type = 'photo'
+    elif update.message.document:
+        file_id = update.message.document.file_id; file_type = 'document'
+    else:
+        return False
+    conn = db()
+    row = conn.execute('SELECT * FROM check_requests WHERE id = ? AND user_id = ?', (request_id, user.id)).fetchone()
+    if not row or row['status'] != 'reserved' or row['check_file_id']:
+        conn.close(); context.user_data.pop('check_upload_request', None)
+        await tracked_reply(update, context, '❌ این درخواست دیگر آماده دریافت عکس چک نیست.')
+        return True
+    conn.execute('UPDATE check_requests SET check_file_id=?, check_file_type=?, updated_at=? WHERE id=?', (file_id, file_type, now_iso(), request_id))
+    conn.commit(); conn.close(); context.user_data.pop('check_upload_request', None)
+    await tracked_reply(update, context,
+        f"✅ *عکس چک دریافت شد.*\n\n🆔 `{request_id}`\n⏳ برای بررسی ادمین/حسابدار ارسال شد.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=user_menu())
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton('✅ تأیید چک', callback_data=f'check_ok_{request_id}', style='success'), InlineKeyboardButton('❌ رد چک', callback_data=f'check_no_{request_id}', style='danger')]])
+    text = ("📄 *چک جدید برای بررسی*\n\n"
+            f"🆔 `{request_id}`\n👤 `{row['requester_name']}`\n🔢 `{row['national_id']}`\n"
+            f"📅 {month_display(row['month'])}\n💰 `{fmt_amount(row['amount'])}` تومان")
+    recipients = set(ADMIN_IDS)
+    if A_CONTENT_ID:
+        recipients.add(A_CONTENT_ID)
+    for staff_id in recipients:
+        try:
+            await tracked_send_message(context.bot, staff_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            if file_type == 'photo':
+                await tracked_send_photo(context.bot, staff_id, file_id, caption=f'📄 عکس چک #{request_id}')
+            else:
+                await tracked_send_document(context.bot, staff_id, file_id, caption=f'📄 فایل چک #{request_id}')
+        except Exception:
+            pass
+    return True
+
+
+async def check_list(update, context, staff_only=False):
+    query = update.callback_query
+    await query.answer()
+    if staff_only and not is_staff(query.from_user.id):
+        return
+    conn = db()
+    if staff_only:
+        rows = conn.execute("SELECT id, requester_name, amount, month, status, check_file_id FROM check_requests WHERE status='reserved' AND check_file_id IS NOT NULL ORDER BY id ASC LIMIT 50").fetchall()
+    else:
+        rows = conn.execute("SELECT id, amount, month, status, check_file_id FROM check_requests WHERE user_id=? ORDER BY id DESC LIMIT 50", (query.from_user.id,)).fetchall()
+    conn.close()
+    if not rows:
+        await tracked_edit(query, context, '📄 *چک‌ها*\n\nموردی برای نمایش وجود ندارد.', parse_mode=ParseMode.MARKDOWN, reply_markup=back_button())
+        return
+    keyboard=[]; parts=['📄 *چک‌ها*\n']
+    status_names={'waiting':'⏳ در انتظار چک مناسب','reserved':'🟡 رزرو / در انتظار عکس','approved':'🟢 تأیید شده','rejected':'🔴 رد شده'}
+    for r in rows:
+        parts.append(f"🆔 `{r['id']}` | 💰 `{fmt_amount(r['amount'])}` | 📅 {month_display(r['month'])} | {status_names.get(r['status'], r['status'])}")
+        if staff_only:
+            keyboard.append([InlineKeyboardButton(f"📄 چک #{r['id']}", callback_data=f'check_item_{r['id']}', style='primary')])
+    keyboard.append([InlineKeyboardButton('🏠 منوی اصلی', callback_data='main', style='primary')])
+    await tracked_edit(query, context, '\n'.join(parts), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def check_item(update, context, request_id):
+    query=update.callback_query; await query.answer()
+    if not is_staff(query.from_user.id): return
+    conn=db(); row=conn.execute('SELECT * FROM check_requests WHERE id=? AND status="reserved" AND check_file_id IS NOT NULL',(request_id,)).fetchone(); conn.close()
+    if not row:
+        await tracked_edit(query, context, '❌ این چک پیدا نشد یا قبلاً بررسی شده است.', reply_markup=back_button()); return
+    text=("📄 *بررسی چک*\n\n"
+          f"🆔 `{row['id']}`\n👤 `{row['requester_name']}`\n🔢 `{row['national_id']}`\n"
+          f"📅 {month_display(row['month'])}\n💰 `{fmt_amount(row['amount'])}` تومان")
+    await tracked_edit(query, context, text, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('✅ تأیید چک', callback_data=f'check_ok_{request_id}', style='success'), InlineKeyboardButton('❌ رد چک', callback_data=f'check_no_{request_id}', style='danger')],
+            [InlineKeyboardButton('⬅️ برگشت', callback_data='a_checks', style='primary')],
+        ]))
+    try:
+        if row['check_file_type']=='photo': await tracked_send_photo(context.bot, query.from_user.id, row['check_file_id'], caption=f'📄 چک #{request_id}')
+        else: await tracked_send_document(context.bot, query.from_user.id, row['check_file_id'], caption=f'📄 چک #{request_id}')
+    except Exception: pass
+
+
+async def approve_check(update, context, request_id):
+    query=update.callback_query; await query.answer('✅ چک تأیید شد')
+    if not is_staff(query.from_user.id): return
+    conn=db(); row=conn.execute('SELECT * FROM check_requests WHERE id=? AND status="reserved" AND check_file_id IS NOT NULL',(request_id,)).fetchone()
+    if not row: conn.close(); return
+    conn.execute("UPDATE check_requests SET status='approved', updated_at=? WHERE id=?",(now_iso(),request_id))
+    if row['target_id']:
+        conn.execute('UPDATE check_targets SET reserved_amount=MAX(0,reserved_amount-?), approved_amount=approved_amount+? WHERE id=?',(row['amount'],row['amount'],row['target_id']))
+    conn.commit(); conn.close()
+    try: await query.edit_message_reply_markup(reply_markup=None)
+    except Exception: pass
+    try: await tracked_send_message(context.bot,row['user_id'],f"✅ *چک شما تأیید شد*\n\n🆔 `{request_id}`\n💰 `{fmt_amount(row['amount'])}` تومان\n📅 {month_display(row['month'])}",parse_mode=ParseMode.MARKDOWN,reply_markup=user_menu())
+    except Exception: pass
+
+
+async def reject_check(update, context, request_id):
+    query=update.callback_query; await query.answer('❌ چک رد شد')
+    if not is_staff(query.from_user.id): return
+    conn=db(); row=conn.execute('SELECT * FROM check_requests WHERE id=? AND status="reserved" AND check_file_id IS NOT NULL',(request_id,)).fetchone()
+    if not row: conn.close(); return
+    conn.execute("UPDATE check_requests SET status='rejected', updated_at=? WHERE id=?",(now_iso(),request_id))
+    if row['target_id']: conn.execute('UPDATE check_targets SET reserved_amount=MAX(0,reserved_amount-?) WHERE id=?',(row['amount'],row['target_id']))
+    conn.commit(); conn.close()
+    try: await query.edit_message_reply_markup(reply_markup=None)
+    except Exception: pass
+    try: await tracked_send_message(context.bot,row['user_id'],f"❌ *چک شما رد شد*\n\n🆔 `{request_id}`\n💰 `{fmt_amount(row['amount'])}` تومان\n📅 {month_display(row['month'])}",parse_mode=ParseMode.MARKDOWN,reply_markup=user_menu())
+    except Exception: pass
+
+
+async def add_check_menu(update, context):
+    query=update.callback_query; await query.answer()
+    if not is_admin(query.from_user.id): return
+    clear_state(context); context.user_data['new_check']=True
+    await tracked_edit(query,context,"➕ *افزودن چک*\n\nفرمت:\n`نام|کدملی|سقف|ماه`\n\nمثال:\n`علی رضایی|0012345678|200|9`\n\nماه فقط عدد ۱ تا ۱۲ است.",parse_mode=ParseMode.MARKDOWN,reply_markup=back_button())
+
+
+async def process_new_check(update, context):
+    if not context.user_data.get('new_check') or not is_admin(update.effective_user.id): return False
+    parts=[x.strip() for x in (update.message.text or '').split('|')]
+    if len(parts)!=4:
+        await tracked_reply(update,context,"❌ فرمت اشتباه است.\n`نام|کدملی|سقف|ماه`",parse_mode=ParseMode.MARKDOWN); return True
+    name,national_id,capacity_raw,month_raw=parts
+    national_id=normalize_national_id(national_id); capacity=parse_amount(capacity_raw); month=parse_month(month_raw)
+    if not name or len(national_id)!=10 or not national_id.isdigit() or capacity is None or month is None:
+        await tracked_reply(update,context,"❌ اطلاعات نامعتبر است. کد ملی باید ۱۰ رقم، ماه بین ۱ تا ۱۲ و سقف بزرگ‌تر از صفر باشد."); return True
+    now=now_iso(); conn=db()
+    conn.execute('INSERT INTO check_targets(owner_name,name_key,national_id,capacity,month,created_at) VALUES(?,?,?,?,?,?)',(name,normalize_person_name(name),national_id,capacity,month,now))
+    target_id=conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+    waiting=conn.execute('SELECT * FROM check_requests WHERE status="waiting" AND month=? AND national_id=? AND requester_name_key=? AND amount<=? ORDER BY id ASC',(month,national_id,normalize_person_name(name),capacity)).fetchall()
+    assigned=[]
+    for r in waiting:
+        target=conn.execute('SELECT * FROM check_targets WHERE id=?',(target_id,)).fetchone()
+        if check_available_amount(target) < r['amount']: break
+        conn.execute("UPDATE check_requests SET target_id=?, owner_name_snapshot=?, national_id_snapshot=?, status='reserved', updated_at=? WHERE id=?",(target_id,name,national_id,now_iso(),r['id']))
+        conn.execute('UPDATE check_targets SET reserved_amount=reserved_amount+? WHERE id=?',(r['amount'],target_id))
+        assigned.append(dict(r))
+    conn.commit(); conn.close(); clear_state(context)
+    await tracked_reply(update,context,f"✅ *چک ثبت شد*\n\n👤 `{name}`\n🔢 `{national_id}`\n📅 {month_display(month)}\n💰 سقف: `{fmt_amount(capacity)}` تومان\n\n🔔 تعداد درخواست‌های منتظر که خودکار به این چک اختصاص یافت: `{len(assigned)}`",parse_mode=ParseMode.MARKDOWN,reply_markup=admin_menu())
+    for r in assigned:
+        try:
+            await tracked_send_message(context.bot,r['user_id'],f"🎉 *چک مناسب برای شما پیدا شد*\n\n🆔 درخواست: `{r['id']}`\n👤 `{name}`\n🔢 `{national_id}`\n📅 {month_display(month)}\n💰 `{fmt_amount(r['amount'])}` تومان\n\nحالا عکس چک را ارسال کنید.",parse_mode=ParseMode.MARKDOWN,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('📷 ارسال عکس چک',callback_data='check_select_'+str(r['id']),style='success')],[InlineKeyboardButton('🏠 منوی اصلی',callback_data='main',style='primary')]]))
+        except Exception: pass
+    return True
 
 
 # =========================================================
@@ -2823,6 +3199,35 @@ async def callback_router(
         return
 
     # -----------------------------------------------------
+    # CHECKS
+    # -----------------------------------------------------
+
+    if data == "u_check":
+        await check_start(update, context); return
+    if data == "u_checks":
+        await check_list(update, context, staff_only=False); return
+    if data == "a_check_add":
+        await add_check_menu(update, context); return
+    if data in ("a_checks", "c_checks"):
+        await check_list(update, context, staff_only=True); return
+    if data.startswith("check_select_"):
+        try: request_id = int(data[len("check_select_"):])
+        except ValueError: return
+        await check_select(update, context, request_id); return
+    if data.startswith("check_item_"):
+        try: request_id = int(data[len("check_item_"):])
+        except ValueError: return
+        await check_item(update, context, request_id); return
+    if data.startswith("check_ok_"):
+        try: request_id = int(data[len("check_ok_"):])
+        except ValueError: return
+        await approve_check(update, context, request_id); return
+    if data.startswith("check_no_"):
+        try: request_id = int(data[len("check_no_"):])
+        except ValueError: return
+        await reject_check(update, context, request_id); return
+
+    # -----------------------------------------------------
     # A CONTENT RECEIPTS
     # -----------------------------------------------------
 
@@ -3262,6 +3667,28 @@ async def text_router(
         )
         return
 
+    if context.user_data.get("new_check"):
+        await process_new_check(update, context)
+        return
+    if context.user_data.get("check_amount"):
+        await receive_check_amount(update, context)
+        return
+    if context.user_data.get("check_name"):
+        await receive_check_name(update, context)
+        return
+    if context.user_data.get("check_national_id"):
+        await receive_check_national_id(update, context)
+        return
+    if context.user_data.get("check_month"):
+        await receive_check_month(update, context)
+        return
+
+
+async def receive_media(update, context):
+    if await receive_check_image(update, context):
+        return
+    await receive_receipt(update, context)
+
 
 # =========================================================
 # PAYMENT REMINDERS
@@ -3449,7 +3876,7 @@ def main():
     application.add_handler(
         MessageHandler(
             filters.PHOTO | filters.Document.ALL,
-            receive_receipt,
+            receive_media,
         )
     )
 
