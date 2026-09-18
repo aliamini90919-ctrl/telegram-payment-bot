@@ -1557,22 +1557,13 @@ async def receive_check_name(update, context):
         return True
     context.user_data.pop('check_name', None)
     context.user_data['pending_check_name'] = name
-    context.user_data['check_national_id'] = True
-    await tracked_reply(update, context, "🔢 کد ملی ۱۰ رقمی را وارد کنید:")
-    return True
-
-
-async def receive_check_national_id(update, context):
-    if not context.user_data.get('check_national_id'):
-        return False
-    national_id = normalize_national_id(update.message.text)
-    if len(national_id) != 10 or not national_id.isdigit():
-        await tracked_reply(update, context, "❌ کد ملی باید دقیقاً ۱۰ رقم باشد. دوباره وارد کنید.")
-        return True
-    context.user_data.pop('check_national_id', None)
-    context.user_data['pending_check_national_id'] = national_id
     context.user_data['check_month'] = True
-    await tracked_reply(update, context, "📅 ماه سررسید چک را فقط به صورت عدد ۱ تا ۱۲ وارد کنید.\nمثال: `9`", parse_mode=ParseMode.MARKDOWN)
+    await tracked_reply(
+        update, context,
+        "📅 ماه سررسید چک را فقط به صورت عدد ۱ تا ۱۲ وارد کنید.\nمثال: `9`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_button()
+    )
     return True
 
 
@@ -1585,30 +1576,36 @@ async def receive_check_month(update, context):
         return True
     amount = context.user_data.pop('pending_check_amount', None)
     name = context.user_data.pop('pending_check_name', None)
-    national_id = context.user_data.pop('pending_check_national_id', None)
     context.user_data.pop('check_month', None)
-    if amount is None or not name or not national_id:
-        await tracked_reply(update, context, "❌ اطلاعات ثبت چک ناقص شد. لطفاً دوباره از «ثبت چک» شروع کنید.", reply_markup=user_menu())
+    if amount is None or not name:
+        await tracked_reply(
+            update, context,
+            "❌ اطلاعات درخواست چک ناقص شد. لطفاً دوباره از «دریافت چک» شروع کنید.",
+            reply_markup=user_menu()
+        )
         return True
-    await create_check_request(update, context, amount, name, national_id, month)
+    await create_check_request(update, context, amount, name, month)
     return True
 
 
-async def create_check_request(update, context, amount, name, national_id, month):
+async def create_check_request(update, context, amount, name, month):
     user = update.effective_user
     name_key = normalize_person_name(name)
     conn = db()
     conn.execute('BEGIN IMMEDIATE')
-    # تطبیق چک: کد ملی و ماه باید دقیقاً یکسان باشند.
-    # نام کاربر معیار تطبیق نیست؛ مبلغ باید از موجودی آزاد چک بیشتر نباشد.
-    # مبلغ درخواستی باید کمتر یا مساوی ظرفیت آزاد چک باشد.
+
+    # فقط ماه و موجودی آزاد چک ملاک تطبیق هستند.
+    # کاربر اصلاً کد ملی وارد نمی‌کند.
     target = conn.execute("""
         SELECT * FROM check_targets
-        WHERE active = 1 AND national_id = ? AND month = ?
+        WHERE active = 1
+          AND month = ?
           AND (capacity - reserved_amount - approved_amount) >= ?
         ORDER BY id ASC LIMIT 1
-    """, (national_id, month, amount)).fetchone()
+    """, (month, amount)).fetchone()
+
     created = now_iso()
+
     if target:
         cur = conn.execute("""
             INSERT INTO check_requests (
@@ -1616,43 +1613,75 @@ async def create_check_request(update, context, amount, name, national_id, month
                 national_id, amount, month, target_id, owner_name_snapshot,
                 national_id_snapshot, status, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
-        """, (user.id, user.username, user.first_name, name, name_key, national_id,
-              amount, month, target['id'], target['owner_name'], target['national_id'], created, created))
+        """, (
+            user.id, user.username, user.first_name, name, name_key,
+            '', amount, month, target['id'], target['owner_name'],
+            target['national_id'], created, created
+        ))
         request_id = cur.lastrowid
-        conn.execute('UPDATE check_targets SET reserved_amount = reserved_amount + ? WHERE id = ?', (amount, target['id']))
-        conn.commit(); conn.close()
-        await tracked_reply(update, context,
+        conn.execute(
+            'UPDATE check_targets SET reserved_amount = reserved_amount + ? WHERE id = ?',
+            (amount, target['id'])
+        )
+        conn.commit()
+        conn.close()
+
+        await tracked_reply(
+            update, context,
             "✅ *چک مناسب پیدا شد و برای شما رزرو شد*\n\n"
-            f"🆔 درخواست چک: `{request_id}`\n👤 نام: `{target['owner_name']}`\n"
-            f"🔢 کد ملی: `{target['national_id']}`\n📅 {month_display(month)}\n"
-            f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\nحالا عکس واضح چک را ارسال کنید.",
+            f"🆔 درخواست چک: `{request_id}`\n"
+            f"👤 نام صاحب چک: `{target['owner_name']}`\n"
+            f"🔢 کد ملی صاحب چک: `{target['national_id']}`\n"
+            f"📅 {month_display(month)}\n"
+            f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\n"
+            "حالا عکس واضح چک را ارسال کنید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('📷 ارسال عکس چک', callback_data=f'check_select_{request_id}', style='success')],
                 [InlineKeyboardButton('🏠 منوی اصلی', callback_data='main', style='primary')],
-            ]))
+            ])
+        )
         return
+
     cur = conn.execute("""
         INSERT INTO check_requests (
             user_id, username, first_name, requester_name, requester_name_key,
             national_id, amount, month, status, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)
-    """, (user.id, user.username, user.first_name, name, name_key, national_id, amount, month, created, created))
+    """, (
+        user.id, user.username, user.first_name, name, name_key,
+        '', amount, month, created, created
+    ))
     request_id = cur.lastrowid
-    conn.commit(); conn.close()
-    await tracked_reply(update, context,
-        "⏳ *برای این مشخصات فعلاً چکی موجود نیست*\n\n"
-        f"👤 نام: `{name}`\n🔢 کد ملی: `{national_id}`\n📅 {month_display(month)}\n"
+    conn.commit()
+    conn.close()
+
+    await tracked_reply(
+        update, context,
+        "⏳ *برای این ماه فعلاً چک با موجودی کافی موجود نیست*\n\n"
+        f"👤 نام درخواست‌کننده: `{name}`\n"
+        f"📅 {month_display(month)}\n"
         f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\n"
-        "درخواست شما در صف انتظار ثبت شد. اگر چکی با همین کد ملی و همین ماه و موجودی کافی اضافه شود، خودکار به شما اطلاع می‌دهیم.",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=user_menu())
-    admin_text = ("🚨 *درخواست جدید ثبت چک*\n\n"
-                  f"🆔 `{request_id}`\n👤 `{name}`\n🔢 `{national_id}`\n"
-                  f"📅 {month_display(month)}\n💰 `{fmt_amount(amount)}` تومان\n\n"
-                  "⚠️ چک مناسب موجود نیست و درخواست در صف انتظار است.")
+        "درخواست شما در صف انتظار ثبت شد. به محض اضافه شدن چک مناسب، خودکار به شما اطلاع می‌دهیم.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=user_menu()
+    )
+
+    admin_text = (
+        "🚨 *درخواست جدید دریافت چک*\n\n"
+        f"🆔 `{request_id}`\n"
+        f"👤 `{name}`\n"
+        f"📅 {month_display(month)}\n"
+        f"💰 `{fmt_amount(amount)}` تومان\n\n"
+        "⚠️ چک مناسب موجود نیست و درخواست در صف انتظار است."
+    )
     for admin_id in ADMIN_IDS:
         try:
-            await tracked_send_message(context.bot, admin_id, admin_text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+            await tracked_send_message(
+                context.bot, admin_id, admin_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=admin_menu()
+            )
         except Exception:
             pass
 
@@ -1810,7 +1839,7 @@ async def process_new_check(update, context):
     target_id=conn.execute('SELECT last_insert_rowid()').fetchone()[0]
     # درخواست‌های منتظر فقط با کد ملی و ماه یکسان و ظرفیت کافی تطبیق داده می‌شوند؛
     # نام کاربر در اختصاص چک نقشی ندارد.
-    waiting=conn.execute('SELECT * FROM check_requests WHERE status="waiting" AND national_id=? AND month=? AND amount<=? ORDER BY id ASC',(national_id,month,capacity)).fetchall()
+    waiting=conn.execute('SELECT * FROM check_requests WHERE status="waiting" AND month=? AND amount<=? ORDER BY id ASC',(month,capacity)).fetchall()
     assigned=[]
     for r in waiting:
         target=conn.execute('SELECT * FROM check_targets WHERE id=?',(target_id,)).fetchone()
@@ -3655,9 +3684,6 @@ async def text_router(
         return
     if context.user_data.get("check_name"):
         await receive_check_name(update, context)
-        return
-    if context.user_data.get("check_national_id"):
-        await receive_check_national_id(update, context)
         return
     if context.user_data.get("check_month"):
         await receive_check_month(update, context)
