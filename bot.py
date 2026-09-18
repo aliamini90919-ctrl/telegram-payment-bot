@@ -1,3 +1,10 @@
+# === FINAL CHECK MATCHING RULES ===
+# Month must match exactly.
+# User national ID MUST be different from the admin check national ID.
+# Remaining check capacity must be >= requested amount.
+# User name is not used for matching.
+# After assignment, show the admin check's own name and national ID to the user.
+
 import asyncio
 import logging
 import os
@@ -1586,12 +1593,15 @@ async def create_check_request(update, context, amount, name, national_id, month
     name_key = normalize_person_name(name)
     conn = db()
     conn.execute('BEGIN IMMEDIATE')
+    # تطبیق چک: کد ملی و ماه باید دقیقاً یکسان باشند.
+    # نام کاربر معیار تطبیق نیست؛ مبلغ باید از موجودی آزاد چک بیشتر نباشد.
+    # مبلغ درخواستی باید کمتر یا مساوی ظرفیت آزاد چک باشد.
     target = conn.execute("""
         SELECT * FROM check_targets
-        WHERE active = 1 AND month = ? AND national_id = ? AND name_key = ?
+        WHERE active = 1 AND national_id = ? AND month = ?
           AND (capacity - reserved_amount - approved_amount) >= ?
         ORDER BY id ASC LIMIT 1
-    """, (month, national_id, name_key, amount)).fetchone()
+    """, (national_id, month, amount)).fetchone()
     created = now_iso()
     if target:
         cur = conn.execute("""
@@ -1628,7 +1638,7 @@ async def create_check_request(update, context, amount, name, national_id, month
         "⏳ *برای این مشخصات فعلاً چکی موجود نیست*\n\n"
         f"👤 نام: `{name}`\n🔢 کد ملی: `{national_id}`\n📅 {month_display(month)}\n"
         f"💰 مبلغ: `{fmt_amount(amount)}` تومان\n\n"
-        "درخواست شما در صف انتظار ثبت شد. اگر چک مناسب برای همین ماه و همین مشخصات اضافه شود، خودکار به شما اطلاع می‌دهیم.",
+        "درخواست شما در صف انتظار ثبت شد. اگر چکی با همین کد ملی و همین ماه و موجودی کافی اضافه شود، خودکار به شما اطلاع می‌دهیم.",
         parse_mode=ParseMode.MARKDOWN, reply_markup=user_menu())
     admin_text = ("🚨 *درخواست جدید ثبت چک*\n\n"
                   f"🆔 `{request_id}`\n👤 `{name}`\n🔢 `{national_id}`\n"
@@ -1792,7 +1802,9 @@ async def process_new_check(update, context):
     now=now_iso(); conn=db()
     conn.execute('INSERT INTO check_targets(owner_name,name_key,national_id,capacity,month,created_at) VALUES(?,?,?,?,?,?)',(name,normalize_person_name(name),national_id,capacity,month,now))
     target_id=conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-    waiting=conn.execute('SELECT * FROM check_requests WHERE status="waiting" AND month=? AND national_id=? AND requester_name_key=? AND amount<=? ORDER BY id ASC',(month,national_id,normalize_person_name(name),capacity)).fetchall()
+    # درخواست‌های منتظر فقط با کد ملی و ماه یکسان و ظرفیت کافی تطبیق داده می‌شوند؛
+    # نام کاربر در اختصاص چک نقشی ندارد.
+    waiting=conn.execute('SELECT * FROM check_requests WHERE status="waiting" AND national_id=? AND month=? AND amount<=? ORDER BY id ASC',(national_id,month,capacity)).fetchall()
     assigned=[]
     for r in waiting:
         target=conn.execute('SELECT * FROM check_targets WHERE id=?',(target_id,)).fetchone()
