@@ -581,7 +581,7 @@ def user_menu():
         ],
         [
             InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests", style="primary"),
-            InlineKeyboardButton("🧾 ارسال فیش", callback_data="u_receipt", style="success"),
+            InlineKeyboardButton("📸 ارسال عکس", callback_data="u_send_photo", style="success"),
         ],
         [
             InlineKeyboardButton("ℹ️ راهنما", callback_data="u_help", style="primary"),
@@ -644,6 +644,18 @@ def back_button():
 # =========================================================
 # USER REQUEST STATUS MENU
 # =========================================================
+
+
+def send_photo_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🧾 ارسال فیش", callback_data="u_receipt", style="success"),
+            InlineKeyboardButton("📄 ارسال چک", callback_data="u_check_photo", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary"),
+        ],
+    ])
 
 def requests_status_menu():
     return InlineKeyboardMarkup([
