@@ -1,3 +1,9 @@
+# === CHECK REQUEST RULES ===
+# User enters: amount + name + month. User does NOT enter a national ID.
+# Matching: month must match exactly and remaining check capacity must cover
+# the requested amount. User name is not used for matching.
+# After assignment, the bot sends the admin check's owner name and national ID.
+#
 # === FINAL CHECK MATCHING RULES ===
 # Month must match exactly.
 # User national ID MUST be different from the admin check national ID.
@@ -1551,8 +1557,9 @@ async def receive_check_name(update, context):
         return True
     context.user_data.pop('check_name', None)
     context.user_data['pending_check_name'] = name
-    
-    
+    context.user_data['check_national_id'] = True
+    await tracked_reply(update, context, "🔢 کد ملی ۱۰ رقمی را وارد کنید:")
+    return True
 
 
 async def receive_check_national_id(update, context):
