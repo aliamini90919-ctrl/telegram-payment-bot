@@ -1170,7 +1170,7 @@ async def my_checks_by_status(update, context, status):
     conn = db()
     rows = conn.execute(
         """
-        SELECT id, amount, month, status, check_file_id
+        SELECT id, amount, month, status, check_file_id, owner_name_snapshot, national_id_snapshot
         FROM check_requests
         WHERE user_id = ? AND status = ?
         ORDER BY id DESC
@@ -1181,22 +1181,22 @@ async def my_checks_by_status(update, context, status):
     conn.close()
 
     title = status_names.get(status, "چک‌ها")
+    context.user_data.pop("account_status_select", None)
+    context.user_data["check_status_select"] = status
 
     if not rows:
-        text = (
-            f"📄 *{title}*\n\n"
-            "موردی در این بخش وجود ندارد."
-        )
+        text = f"📄 *{title}*\n\nموردی در این بخش وجود ندارد."
     else:
-        parts = [f"📄 *{title}*\n"]
-        for row in rows:
+        parts = [
+            f"📄 *{title}*\n",
+            "برای انتخاب، شماره مورد را ارسال کنید:",
+            "",
+        ]
+        for i, row in enumerate(rows, 1):
             file_state = "📷 عکس ارسال شده" if row["check_file_id"] else "📎 عکس ارسال نشده"
             parts.append(
-                f"🆔 درخواست: `{row['id']}`\n"
-                f"💰 مبلغ: `{fmt_amount(row['amount'])}` تومان\n"
-                f"📅 {month_display(row['month'])}\n"
-                f"{file_state}\n"
-                "━━━━━━━━━━━━━━"
+                f"*{i}.* 🆔 درخواست `{row['id']}` | 💰 `{fmt_amount(row['amount'])}` تومان | "
+                f"📅 {month_display(row['month'])} | {file_state}"
             )
         text = "\n".join(parts)
 
@@ -1205,7 +1205,10 @@ async def my_checks_by_status(update, context, status):
         context,
         text,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=checks_status_menu(),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ بازگشت به وضعیت چک‌ها", callback_data="ur_checks", style="primary")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
+        ]),
     )
 
 
@@ -1215,11 +1218,9 @@ async def my_requests_by_status(
     status,
 ):
     query = update.callback_query
-
     await query.answer()
 
     user_id = update.effective_user.id
-
     status_names = {
         "waiting": "⏳ در انتظار حساب",
         "reserved": "🧾 در انتظار تایید فیش",
@@ -1230,7 +1231,6 @@ async def my_requests_by_status(
     }
 
     conn = db()
-
     if status == "payment_pending":
         rows = conn.execute("""
             SELECT id, amount, status, receipt_file_id, created_at
@@ -1260,58 +1260,312 @@ async def my_requests_by_status(
             ORDER BY id DESC
             LIMIT 20
         """, (user_id, status)).fetchall()
-
     conn.close()
 
-    title = status_names.get(
-        status,
-        "درخواست‌ها",
-    )
+    context.user_data.pop("check_status_select", None)
+    context.user_data["account_status_select"] = status
 
-    # -----------------------------------------------------
-    # NO REQUEST
-    # -----------------------------------------------------
-
+    title = status_names.get(status, "درخواست‌ها")
     if not rows:
-
-        text = (
-            f"📋 *{title}*\n\n"
-            "درخواستی در این بخش وجود ندارد."
-        )
-
-    # -----------------------------------------------------
-    # REQUESTS
-    # -----------------------------------------------------
-
+        text = f"📋 *{title}*\n\nدرخواستی در این بخش وجود ندارد."
     else:
-
         parts = [
-            f"📋 *{title}*\n"
+            f"📋 *{title}*\n",
+            "برای انتخاب، شماره مورد را ارسال کنید:",
+            "",
         ]
-
-        for row in rows:
-
-            receipt = (
-                "🧾 فیش دریافت شده"
-                if row["receipt_file_id"]
-                else "📎 بدون فیش"
-            )
-
+        for i, row in enumerate(rows, 1):
+            receipt = "🧾 فیش دریافت شده" if row["receipt_file_id"] else "📎 بدون فیش"
             parts.append(
-                f"🆔 درخواست: `{row['id']}`\n"
-                f"💰 مبلغ: `{fmt_amount(row['amount'])}` تومان\n"
-                f"📌 وضعیت: {status_names.get(row['status'], row['status'])}\n"
-                f"{receipt}\n"
-                "━━━━━━━━━━━━━━"
+                f"*{i}.* 🆔 درخواست `{row['id']}` | 💰 `{fmt_amount(row['amount'])}` تومان | {receipt}"
             )
-
         text = "\n".join(parts)
 
-    await tracked_edit(query, context, 
+    await tracked_edit(
+        query,
+        context,
         text,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=requests_status_keyboard(),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ بازگشت به حساب‌ها", callback_data="ur_accounts", style="primary")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
+        ]),
     )
+
+
+async def user_account_status_select(update, context, number_text):
+    status = context.user_data.get("account_status_select")
+    if not status:
+        return False
+
+    try:
+        index = int(str(number_text).strip())
+    except ValueError:
+        await tracked_reply(update, context, "❌ فقط شماره مورد را وارد کنید. مثلاً `1`", parse_mode=ParseMode.MARKDOWN)
+        return True
+
+    if index < 1:
+        await tracked_reply(update, context, "❌ شماره مورد نامعتبر است. مثلاً `1` یا `2` وارد کنید.")
+        return True
+
+    user_id = update.effective_user.id
+    conn = db()
+    if status == "payment_pending":
+        rows = conn.execute("""
+            SELECT id, amount, status, receipt_file_id, target_id, account_number_snapshot, reservation_name, first_name
+            FROM requests
+            WHERE user_id = ? AND status = 'reserved' AND receipt_file_id IS NULL
+            ORDER BY id DESC LIMIT 20
+        """, (user_id,)).fetchall()
+    elif status == "reserved":
+        rows = conn.execute("""
+            SELECT id, amount, status, receipt_file_id, target_id, account_number_snapshot, reservation_name, first_name
+            FROM requests
+            WHERE user_id = ? AND status = 'reserved' AND receipt_file_id IS NOT NULL
+            ORDER BY id DESC LIMIT 20
+        """, (user_id,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT id, amount, status, receipt_file_id, target_id, account_number_snapshot, reservation_name, first_name
+            FROM requests
+            WHERE user_id = ? AND status = ?
+            ORDER BY id DESC LIMIT 20
+        """, (user_id, status)).fetchall()
+
+    if index > len(rows):
+        conn.close()
+        await tracked_reply(update, context, "❌ این شماره در فهرست وجود ندارد. دوباره شماره درست را وارد کنید.")
+        return True
+
+    row = rows[index - 1]
+    request_id = row["id"]
+
+    # درخواست ردشده: برای ارسال فیش مجدد، همان حساب را دوباره رزرو کن؛
+    # اگر حساب قبلی دیگر ظرفیت نداشت، یک حساب مناسب دیگر پیدا کن.
+    if status == "rejected":
+        target = None
+        if row["target_id"]:
+            target = conn.execute("""
+                SELECT * FROM payment_targets
+                WHERE id = ? AND active = 1
+                  AND (deadline_at IS NULL OR deadline_at > ?)
+                  AND (capacity - reserved_amount - paid_amount) >= ?
+            """, (row["target_id"], now_iso(), row["amount"])).fetchone()
+        if not target:
+            target = conn.execute("""
+                SELECT * FROM payment_targets
+                WHERE active = 1
+                  AND (deadline_at IS NULL OR deadline_at > ?)
+                  AND (capacity - reserved_amount - paid_amount) >= ?
+                ORDER BY CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC, deadline_at ASC, id ASC
+                LIMIT 1
+            """, (now_iso(), row["amount"])).fetchone()
+
+        if not target:
+            conn.close()
+            await tracked_reply(
+                update, context,
+                "❌ فعلاً حسابی با ظرفیت کافی برای ارسال مجدد فیش این درخواست وجود ندارد.\n\nبه محض موجود شدن حساب مناسب، می‌توانید دوباره اقدام کنید.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ حساب‌ها", callback_data="ur_accounts", style="primary")],
+                    [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
+                ])
+            )
+            return True
+
+        conn.execute("""
+            UPDATE requests
+            SET target_id = ?, account_number_snapshot = ?, status = 'reserved',
+                receipt_file_id = NULL, receipt_type = NULL, updated_at = ?, next_reminder_at = ?
+            WHERE id = ? AND user_id = ? AND status = 'rejected'
+        """, (target["id"], target["account_number"], now_iso(), reminder_due(), request_id, user_id))
+        conn.execute("UPDATE payment_targets SET reserved_amount = reserved_amount + ? WHERE id = ?", (row["amount"], target["id"]))
+        conn.commit()
+        conn.close()
+        context.user_data.pop("account_status_select", None)
+        context.user_data["receipt_request"] = request_id
+
+        await tracked_reply(
+            update, context,
+            "🔄 *ارسال مجدد فیش*\n\n"
+            f"🆔 درخواست: `{request_id}`\n"
+            f"🏦 شماره حساب: `{target['account_number']}`\n"
+            f"💰 مبلغ: `{fmt_amount(row['amount'])}` تومان\n\n"
+            "حالا فیش جدید را به صورت عکس یا فایل ارسال کنید تا دوباره برای ادمین/حسابدار بررسی شود.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
+        return True
+
+    # در انتظار واریز: مستقیماً برای همین درخواست فیش بگیر.
+    if status == "payment_pending":
+        conn.close()
+        context.user_data.pop("account_status_select", None)
+        context.user_data["receipt_request"] = request_id
+        await tracked_reply(
+            update, context,
+            "🧾 *ارسال فیش*\n\n"
+            f"🆔 درخواست: `{request_id}`\n"
+            f"💰 مبلغ: `{fmt_amount(row['amount'])}` تومان\n\n"
+            "فیش پرداخت را به صورت عکس یا فایل ارسال کنید.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
+        return True
+
+    conn.close()
+    context.user_data.pop("account_status_select", None)
+    status_text = {
+        "waiting": "⏳ در انتظار اختصاص حساب",
+        "reserved": "🧾 فیش برای این درخواست قبلاً ارسال شده و در انتظار بررسی است",
+        "paid": "🟢 پرداخت تأیید شده است",
+        "cancelled": "⚫ این درخواست لغو شده است",
+        "rejected": "🔴 رد شده است",
+    }.get(status, status)
+    await tracked_reply(
+        update, context,
+        "📋 *جزئیات درخواست*\n\n"
+        f"🆔 `{request_id}`\n"
+        f"💰 `{fmt_amount(row['amount'])}` تومان\n"
+        f"🏦 `{row['account_number_snapshot'] or '-'}`\n"
+        f"📌 {status_text}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ حساب‌ها", callback_data="ur_accounts", style="primary")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
+        ])
+    )
+    return True
+
+
+async def user_check_status_select(update, context, number_text):
+    status = context.user_data.get("check_status_select")
+    if not status:
+        return False
+
+    try:
+        index = int(str(number_text).strip())
+    except ValueError:
+        await tracked_reply(update, context, "❌ فقط شماره مورد را وارد کنید. مثلاً `1`", parse_mode=ParseMode.MARKDOWN)
+        return True
+
+    if index < 1:
+        await tracked_reply(update, context, "❌ شماره مورد نامعتبر است. مثلاً `1` یا `2` وارد کنید.")
+        return True
+
+    user_id = update.effective_user.id
+    conn = db()
+    rows = conn.execute("""
+        SELECT * FROM check_requests
+        WHERE user_id = ? AND status = ?
+        ORDER BY id DESC LIMIT 50
+    """, (user_id, status)).fetchall()
+
+    if index > len(rows):
+        conn.close()
+        await tracked_reply(update, context, "❌ این شماره در فهرست وجود ندارد. دوباره شماره درست را وارد کنید.")
+        return True
+
+    row = rows[index - 1]
+    request_id = row["id"]
+
+    # چک ردشده: دوباره برای همان مبلغ/ماه یک چک مناسب رزرو کن و عکس جدید بگیر.
+    if status == "rejected":
+        target = None
+        if row["target_id"]:
+            target = conn.execute("""
+                SELECT * FROM check_targets
+                WHERE id = ? AND active = 1 AND month = ?
+                  AND (capacity - reserved_amount - approved_amount) >= ?
+            """, (row["target_id"], row["month"], row["amount"])).fetchone()
+        if not target:
+            target = conn.execute("""
+                SELECT * FROM check_targets
+                WHERE active = 1 AND month = ?
+                  AND (capacity - reserved_amount - approved_amount) >= ?
+                ORDER BY id ASC LIMIT 1
+            """, (row["month"], row["amount"])).fetchone()
+
+        if not target:
+            conn.close()
+            await tracked_reply(
+                update, context,
+                "❌ فعلاً چک مناسب با همین ماه و ظرفیت کافی برای ارسال مجدد وجود ندارد.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ چک‌ها", callback_data="ur_checks", style="primary")],
+                    [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
+                ])
+            )
+            return True
+
+        conn.execute("""
+            UPDATE check_requests
+            SET target_id = ?, owner_name_snapshot = ?, national_id_snapshot = ?,
+                status = 'reserved', check_file_id = NULL, check_file_type = NULL, updated_at = ?
+            WHERE id = ? AND user_id = ? AND status = 'rejected'
+        """, (target["id"], target["owner_name"], target["national_id"], now_iso(), request_id, user_id))
+        conn.execute("UPDATE check_targets SET reserved_amount = reserved_amount + ? WHERE id = ?", (row["amount"], target["id"]))
+        conn.commit()
+        conn.close()
+        context.user_data.pop("check_status_select", None)
+        context.user_data["check_upload_request"] = request_id
+
+        await tracked_reply(
+            update, context,
+            "🔄 *ارسال مجدد عکس چک*\n\n"
+            f"🆔 درخواست چک: `{request_id}`\n"
+            f"👤 صاحب چک: `{target['owner_name']}`\n"
+            f"🔢 کد ملی صاحب چک: `{target['national_id']}`\n"
+            f"📅 {month_display(row['month'])}\n"
+            f"💰 `{fmt_amount(row['amount'])}` تومان\n\n"
+            "عکس جدید چک را ارسال کنید تا دوباره برای ادمین/حسابدار بررسی شود.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
+        return True
+
+    if status == "reserved" and not row["check_file_id"]:
+        conn.close()
+        context.user_data.pop("check_status_select", None)
+        context.user_data["check_upload_request"] = request_id
+        await tracked_reply(
+            update, context,
+            "📷 *ارسال عکس چک*\n\n"
+            f"🆔 درخواست: `{request_id}`\n"
+            f"👤 صاحب چک: `{row['owner_name_snapshot'] or '-'}`\n"
+            f"🔢 کد ملی صاحب چک: `{row['national_id_snapshot'] or '-'}`\n"
+            f"📅 {month_display(row['month'])}\n"
+            f"💰 `{fmt_amount(row['amount'])}` تومان\n\n"
+            "عکس واضح چک را ارسال کنید.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
+        return True
+
+    conn.close()
+    context.user_data.pop("check_status_select", None)
+    status_text = {
+        "waiting": "⏳ هنوز چک مناسب اختصاص داده نشده است",
+        "reserved": "🟡 عکس چک ارسال شده و در انتظار بررسی است",
+        "approved": "🟢 چک تأیید شده است",
+        "rejected": "🔴 چک رد شده است",
+    }.get(status, status)
+    await tracked_reply(
+        update, context,
+        "📄 *جزئیات چک*\n\n"
+        f"🆔 درخواست: `{request_id}`\n"
+        f"👤 صاحب چک: `{row['owner_name_snapshot'] or '-'}`\n"
+        f"🔢 کد ملی صاحب چک: `{row['national_id_snapshot'] or '-'}`\n"
+        f"📅 {month_display(row['month'])}\n"
+        f"💰 `{fmt_amount(row['amount'])}` تومان\n"
+        f"📌 {status_text}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ چک‌ها", callback_data="ur_checks", style="primary")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
+        ])
+    )
+    return True
 
 
 # =========================================================
@@ -3740,6 +3994,14 @@ async def text_router(
 ):
     if await receive_adpass_password(update, context):
         return
+
+    if context.user_data.get("account_status_select"):
+        if await user_account_status_select(update, context, update.message.text):
+            return
+
+    if context.user_data.get("check_status_select"):
+        if await user_check_status_select(update, context, update.message.text):
+            return
 
     if context.user_data.get("edit_target_id"):
         await process_edit_target(update, context)
