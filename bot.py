@@ -584,9 +584,6 @@ def user_menu():
             InlineKeyboardButton("🧾 ارسال فیش", callback_data="u_receipt", style="success"),
         ],
         [
-            InlineKeyboardButton("📑 چک‌های من", callback_data="u_checks", style="success"),
-        ],
-        [
             InlineKeyboardButton("ℹ️ راهنما", callback_data="u_help", style="primary"),
         ],
     ])
@@ -651,41 +648,27 @@ def back_button():
 def requests_status_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                "🔴 رد شده ها",
-                callback_data="ur_rejected",
-             style="danger"),
-            InlineKeyboardButton(
-                "🟢 تایید شده ها",
-                callback_data="ur_paid",
-             style="success"),
+            InlineKeyboardButton("🏦 حساب‌ها", callback_data="ur_accounts", style="primary"),
+            InlineKeyboardButton("📄 چک‌ها", callback_data="ur_checks", style="success"),
         ],
         [
-            InlineKeyboardButton(
-                "⚫ لغو شده ها",
-                callback_data="ur_cancelled",
-             style="danger"),
+            InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary"),
+        ],
+    ])
+
+
+def checks_status_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⏳ در انتظار چک", callback_data="uc_waiting", style="primary"),
+            InlineKeyboardButton("🟡 در انتظار عکس/بررسی", callback_data="uc_reserved", style="primary"),
         ],
         [
-            InlineKeyboardButton(
-                "⏳ در انتظار حساب",
-                callback_data="ur_waiting",
-             style="primary"),
-            InlineKeyboardButton(
-                "💳 در انتظار واریز",
-                callback_data="ur_payment_pending",
-             style="primary"),
+            InlineKeyboardButton("🟢 تأیید شده‌ها", callback_data="uc_approved", style="success"),
+            InlineKeyboardButton("🔴 رد شده‌ها", callback_data="uc_rejected", style="danger"),
         ],
         [
-            InlineKeyboardButton(
-                "🧾 در انتظار تایید فیش",
-                callback_data="ur_reserved",
-             style="success"),
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ بازگشت",
-                callback_data="main"),
+            InlineKeyboardButton("⬅️ درخواست‌های من", callback_data="u_requests", style="primary"),
         ],
     ])
 
@@ -1159,16 +1142,70 @@ async def create_request(
 
 async def my_requests_menu(update, context):
     query = update.callback_query
-
     await query.answer()
-
     clear_state(context)
 
-    await tracked_edit(query, context, 
+    await tracked_edit(
+        query,
+        context,
         "📋 *درخواست‌های من*\n\n"
-        "لطفاً وضعیت درخواست‌ها را انتخاب کنید:",
+        "نوع درخواست را انتخاب کنید:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=requests_status_menu(),
+    )
+
+
+async def my_checks_by_status(update, context, status):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    status_names = {
+        "waiting": "⏳ در انتظار چک",
+        "reserved": "🟡 در انتظار عکس/بررسی",
+        "approved": "🟢 تأیید شده‌ها",
+        "rejected": "🔴 رد شده‌ها",
+    }
+
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT id, amount, month, status, check_file_id
+        FROM check_requests
+        WHERE user_id = ? AND status = ?
+        ORDER BY id DESC
+        LIMIT 50
+        """,
+        (user_id, status),
+    ).fetchall()
+    conn.close()
+
+    title = status_names.get(status, "چک‌ها")
+
+    if not rows:
+        text = (
+            f"📄 *{title}*\n\n"
+            "موردی در این بخش وجود ندارد."
+        )
+    else:
+        parts = [f"📄 *{title}*\n"]
+        for row in rows:
+            file_state = "📷 عکس ارسال شده" if row["check_file_id"] else "📎 عکس ارسال نشده"
+            parts.append(
+                f"🆔 درخواست: `{row['id']}`\n"
+                f"💰 مبلغ: `{fmt_amount(row['amount'])}` تومان\n"
+                f"📅 {month_display(row['month'])}\n"
+                f"{file_state}\n"
+                "━━━━━━━━━━━━━━"
+            )
+        text = "\n".join(parts)
+
+    await tracked_edit(
+        query,
+        context,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=checks_status_menu(),
     )
 
 
@@ -3156,6 +3193,50 @@ async def callback_router(
         return
 
     # -----------------------------------------------------
+    # REQUEST CATEGORIES
+    # -----------------------------------------------------
+
+    if data == "ur_accounts":
+        clear_state(context)
+        await tracked_edit(
+            query,
+            context,
+            "🏦 *حساب‌ها*\n\n"
+            "وضعیت درخواست‌های حساب را انتخاب کنید:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=requests_status_keyboard(),
+        )
+        return
+
+    if data == "ur_checks":
+        clear_state(context)
+        await tracked_edit(
+            query,
+            context,
+            "📄 *چک‌ها*\n\n"
+            "وضعیت چک‌ها را انتخاب کنید:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=checks_status_menu(),
+        )
+        return
+
+    if data == "uc_waiting":
+        await my_checks_by_status(update, context, "waiting")
+        return
+
+    if data == "uc_reserved":
+        await my_checks_by_status(update, context, "reserved")
+        return
+
+    if data == "uc_approved":
+        await my_checks_by_status(update, context, "approved")
+        return
+
+    if data == "uc_rejected":
+        await my_checks_by_status(update, context, "rejected")
+        return
+
+    # -----------------------------------------------------
     # REQUESTS BY STATUS
     # -----------------------------------------------------
 
@@ -3214,7 +3295,16 @@ async def callback_router(
     if data == "u_check":
         await check_start(update, context); return
     if data == "u_checks":
-        await check_list(update, context, staff_only=False); return
+        clear_state(context)
+        await tracked_edit(
+            query,
+            context,
+            "📄 *چک‌ها*\n\n"
+            "وضعیت چک‌ها را انتخاب کنید:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=checks_status_menu(),
+        )
+        return
     if data == "a_check_add":
         await add_check_menu(update, context); return
     if data in ("a_checks", "c_checks"):
