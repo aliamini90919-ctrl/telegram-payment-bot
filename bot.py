@@ -619,9 +619,6 @@ def admin_menu():
             InlineKeyboardButton("➕ افزودن چک", callback_data="a_check_add", style="primary"),
         ],
         [
-            InlineKeyboardButton("📊 داشبورد مدیریت", callback_data="a_dashboard", style="success"),
-        ],
-        [
             InlineKeyboardButton("📊 وضعیت حساب‌ها", callback_data="a_status", style="primary"),
             InlineKeyboardButton("⏳ در انتظار واریز", callback_data="a_payment_pending", style="primary"),
         ],
@@ -1149,40 +1146,6 @@ async def create_request(
             )
         except Exception:
             pass
-
-
-
-# =========================================================
-# SMART NOTIFICATION HELPERS
-# =========================================================
-
-async def notify_capacity_change(context):
-    """اگر صف هنوز وجود دارد ولی ظرفیت ایجاد شده، ادمین را مطلع می‌کند."""
-    conn = db()
-    waiting = conn.execute("""
-        SELECT COUNT(*) AS count, COALESCE(SUM(amount), 0) AS amount
-        FROM requests
-        WHERE status='waiting'
-    """).fetchone()
-    available = conn.execute("""
-        SELECT COALESCE(SUM(
-            MAX(0, capacity - reserved_amount - paid_amount)
-        ), 0) AS amount
-        FROM payment_targets
-        WHERE active=1
-          AND (deadline_at IS NULL OR deadline_at > ?)
-    """, (now_iso(),)).fetchone()
-    conn.close()
-
-    if waiting["count"] and available["amount"]:
-        await notify_admins(
-            context.bot,
-            "🔔 *هشدار صف*\n\n"
-            f"⏳ درخواست در انتظار: `{waiting['count']}`\n"
-            f"💰 مجموع درخواست‌ها: `{fmt_amount(waiting['amount'])}` تومان\n"
-            f"🏦 ظرفیت آزاد فعلی: `{fmt_amount(available['amount'])}` تومان\n\n"
-            "🤖 سیستم صف هوشمند آماده تخصیص درخواست‌های قابل انجام است.",
-        )
 
 
 # =========================================================
@@ -1804,13 +1767,11 @@ async def receive_receipt(
     ])
 
     admin_text = (
-        "🚨 *فیش جدید — نیازمند بررسی فوری*\n\n"
+        "🧾 *فیش جدید*\n\n"
         f"🆔 درخواست: `{request_id}`\n"
         f"👤 نام رزرو: {request['reservation_name'] or request['first_name'] or '-'}\n"
         f"🔹 @{user.username or '-'}\n"
-        f"🔢 User ID: `{user.id}`\n"
-        f"💰 `{fmt_amount(request['amount'])}` تومان\n\n"
-        "⏱️ فیش همین الان دریافت شد؛ برای جلوگیری از تأخیر بررسی کنید."
+        f"💰 `{fmt_amount(request['amount'])}` تومان"
     )
 
     for admin_id in ADMIN_IDS:
@@ -3113,108 +3074,30 @@ async def pending_item(
 
 
 async def assign_waiting_requests(context, conn):
-    """
-    تخصیص هوشمند صف:
-    1) اول درخواست‌هایی که واقعاً قابل تخصیص‌اند بررسی می‌شوند.
-    2) تطابق دقیق ظرفیت اولویت دارد.
-    3) بعد کمترین فضای هدررفته انتخاب می‌شود.
-    4) در تساوی، درخواست قدیمی‌تر زودتر می‌رود.
-    5) هیچ درخواست بزرگ‌تر باعث قفل شدن کل صف نمی‌شود.
-    """
     assigned = []
-
     while True:
-        waiting = conn.execute("""
-            SELECT *
-            FROM requests
-            WHERE status = 'waiting'
-            ORDER BY created_at ASC, id ASC
-            LIMIT 100
-        """).fetchall()
-
-        if not waiting:
+        request = conn.execute("SELECT * FROM requests WHERE status = 'waiting' ORDER BY id ASC LIMIT 1").fetchone()
+        if not request:
             break
-
-        targets = conn.execute("""
-            SELECT *
-            FROM payment_targets
-            WHERE active = 1
-              AND (deadline_at IS NULL OR deadline_at > ?)
-        """, (now_iso(),)).fetchall()
-
-        if not targets:
+        target = conn.execute("""
+            SELECT * FROM payment_targets
+            WHERE active = 1 AND (deadline_at IS NULL OR deadline_at > ?)
+              AND (capacity - reserved_amount - paid_amount) >= ?
+            ORDER BY CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC, deadline_at ASC, id ASC
+            LIMIT 1
+        """, (now_iso(), request['amount'])).fetchone()
+        if not target:
             break
-
-        best_pair = None
-
-        for request in waiting:
-            amount = int(request["amount"])
-            for target in targets:
-                remaining = (
-                    int(target["capacity"])
-                    - int(target["reserved_amount"])
-                    - int(target["paid_amount"])
-                )
-                if remaining < amount:
-                    continue
-
-                leftover = remaining - amount
-                deadline = (
-                    parse_iso(target["deadline_at"])
-                    if target["deadline_at"]
-                    else None
-                )
-                deadline_ts = deadline.timestamp() if deadline else float("inf")
-
-                score = (
-                    0 if leftover == 0 else 1,
-                    leftover,
-                    deadline_ts,
-                    request["created_at"] or "",
-                    int(request["id"]),
-                    int(target["id"]),
-                )
-
-                if best_pair is None or score < best_pair[0]:
-                    best_pair = (score, request, target)
-
-        if best_pair is None:
-            break
-
-        _, request, target = best_pair
         now = now_iso()
-
-        conn.execute("""
-            UPDATE requests
-            SET target_id=?,
-                account_number_snapshot=?,
-                status='reserved',
-                updated_at=?,
-                next_reminder_at=?
-            WHERE id=? AND status='waiting'
-        """, (
-            target["id"],
-            target["account_number"],
-            now,
-            reminder_due(now),
-            request["id"],
-        ))
-
-        conn.execute("""
-            UPDATE payment_targets
-            SET reserved_amount=reserved_amount+?
-            WHERE id=?
-        """, (request["amount"], target["id"]))
-
+        conn.execute("""UPDATE requests SET target_id=?, account_number_snapshot=?, status='reserved', updated_at=?, next_reminder_at=? WHERE id=? AND status='waiting'""", (target['id'], target['account_number'], now, reminder_due(now), request['id']))
+        conn.execute("UPDATE payment_targets SET reserved_amount=reserved_amount+? WHERE id=?", (request['amount'], target['id']))
         assigned.append((dict(request), dict(target)))
-
     return assigned
 
 
 # =========================================================
 # ADD ACCOUNT
 # =========================================================
-
 
 async def add_account_menu(
     update,
@@ -3357,9 +3240,6 @@ async def process_new_account(
             )
         except Exception:
             pass
-
-
-    await notify_capacity_change(context)
 
 
 # =========================================================
@@ -3869,26 +3749,6 @@ async def callback_router(
             update,
             context,
         )
-        return
-
-    # -----------------------------------------------------
-    # ADMIN DASHBOARD / SMART QUEUE
-    # -----------------------------------------------------
-
-    if data == "a_dashboard":
-        await admin_dashboard(update, context)
-        return
-
-    if data == "a_queue":
-        await admin_smart_queue(update, context)
-        return
-
-    if data.startswith("q_"):
-        try:
-            request_id = int(data[2:])
-        except ValueError:
-            return
-        await smart_queue_request_detail(update, context, request_id)
         return
 
     # -----------------------------------------------------
