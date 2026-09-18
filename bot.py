@@ -1551,9 +1551,8 @@ async def receive_check_name(update, context):
         return True
     context.user_data.pop('check_name', None)
     context.user_data['pending_check_name'] = name
-    context.user_data['check_national_id'] = True
-    await tracked_reply(update, context, "🔢 کد ملی ۱۰ رقمی را وارد کنید:")
-    return True
+    
+    
 
 
 async def receive_check_national_id(update, context):
