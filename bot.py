@@ -1596,8 +1596,7 @@ async def receipt_menu(update, context):
         SELECT id, reservation_name, first_name, amount, created_at
         FROM requests
         WHERE user_id = ?
-          AND status = 'reserved'
-          AND receipt_file_id IS NULL
+          AND status IN ('reserved', 'rejected')
         ORDER BY id DESC
         LIMIT 50
     """, (user_id,)).fetchall()
@@ -1653,9 +1652,10 @@ async def receipt_select(update, context, request_id):
         )
         return
 
-    if request["status"] != "reserved" or request["receipt_file_id"]:
-        await tracked_edit(query, context, 
-            "❌ این رزرو دیگر برای ارسال فیش قابل انتخاب نیست.",
+    if request["status"] not in ("reserved", "rejected"):
+        await tracked_edit(
+            query, context,
+            "❌ این درخواست دیگر برای ارسال فیش قابل انتخاب نیست.",
             reply_markup=back_button(),
         )
         return
@@ -1726,6 +1726,7 @@ async def receive_receipt(
         UPDATE requests
         SET receipt_file_id = ?,
             receipt_type = ?,
+            status = 'reserved',
             updated_at = ?,
             next_reminder_at = NULL
         WHERE id = ?
@@ -1995,7 +1996,7 @@ async def check_select(update, context, request_id):
     conn = db()
     row = conn.execute('SELECT * FROM check_requests WHERE id = ? AND user_id = ?', (request_id, query.from_user.id)).fetchone()
     conn.close()
-    if not row or row['status'] != 'reserved' or row['check_file_id']:
+    if not row or row['status'] not in ('reserved', 'rejected'):
         await tracked_edit(query, context, '❌ این درخواست چک دیگر آماده دریافت عکس نیست.', reply_markup=back_button())
         return
     context.user_data['check_upload_request'] = request_id
@@ -2024,7 +2025,7 @@ async def receive_check_image(update, context):
         conn.close(); context.user_data.pop('check_upload_request', None)
         await tracked_reply(update, context, '❌ این درخواست دیگر آماده دریافت عکس چک نیست.')
         return True
-    conn.execute('UPDATE check_requests SET check_file_id=?, check_file_type=?, updated_at=? WHERE id=?', (file_id, file_type, now_iso(), request_id))
+    conn.execute("UPDATE check_requests SET check_file_id=?, check_file_type=?, status='reserved', updated_at=? WHERE id=?", (file_id, file_type, now_iso(), request_id))
     conn.commit(); conn.close(); context.user_data.pop('check_upload_request', None)
     await tracked_reply(update, context,
         f"✅ *عکس چک دریافت شد.*\n\n🆔 `{request_id}`\n⏳ برای بررسی ادمین/حسابدار ارسال شد.",
@@ -3606,6 +3607,91 @@ async def callback_router(
         except ValueError:
             return
         await a_content_receipt_item(update, context, request_id)
+        return
+
+    # -----------------------------------------------------
+    # SEND PHOTO MENU
+    # -----------------------------------------------------
+
+    if data == "u_send_photo":
+        clear_state(context)
+        await tracked_edit(
+            query, context,
+            "📸 *ارسال عکس*\n\nانتخاب کنید چه چیزی می‌خواهید ارسال کنید:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=send_photo_menu(),
+        )
+        return
+
+    if data == "u_check_photo":
+        conn = db()
+        rows = conn.execute("""
+            SELECT id, amount, month, status
+            FROM check_requests
+            WHERE user_id = ? AND status IN ('reserved', 'rejected')
+            ORDER BY id DESC LIMIT 50
+        """, (query.from_user.id,)).fetchall()
+        conn.close()
+
+        if not rows:
+            await tracked_edit(
+                query, context,
+                "📄 *ارسال چک*\n\n❌ چکی برای ارسال عکس پیدا نشد.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=send_photo_menu(),
+            )
+            return
+
+        keyboard = []
+        for i, row in enumerate(rows, 1):
+            status_text = "🔴 رد شده" if row["status"] == "rejected" else "🟡 در انتظار بررسی"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{i}. چک #{row['id']} | {fmt_amount(row['amount'])} | ماه {row['month']} | {status_text}",
+                    callback_data=f"check_upload_{row['id']}",
+                    style="primary",
+                )
+            ])
+        keyboard.append([
+            InlineKeyboardButton("⬅️ بازگشت", callback_data="u_send_photo", style="primary")
+        ])
+        await tracked_edit(
+            query, context,
+            "📄 *ارسال چک*\n\nچک موردنظر را انتخاب کنید:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if data.startswith("check_upload_"):
+        try:
+            request_id = int(data[len("check_upload_"):])
+        except ValueError:
+            await query.answer("گزینه نامعتبر است.", show_alert=True)
+            return
+
+        conn = db()
+        row = conn.execute(
+            "SELECT * FROM check_requests WHERE id=? AND user_id=?",
+            (request_id, query.from_user.id)
+        ).fetchone()
+        conn.close()
+
+        if not row or row["status"] not in ("reserved", "rejected"):
+            await query.answer("این درخواست دیگر قابل ارسال عکس نیست.", show_alert=True)
+            return
+
+        context.user_data["check_upload_request"] = request_id
+        await tracked_edit(
+            query, context,
+            "📷 *ارسال عکس چک*\n\n"
+            f"🆔 درخواست: `{request_id}`\n"
+            f"📅 {month_display(row['month'])}\n"
+            f"💰 `{fmt_amount(row['amount'])}` تومان\n\n"
+            "حالا عکس چک را ارسال کنید.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button(),
+        )
         return
 
     # -----------------------------------------------------
