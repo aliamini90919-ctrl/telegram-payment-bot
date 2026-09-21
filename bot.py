@@ -5,10 +5,11 @@
 # After assignment, the bot sends the admin check's owner name and national ID.
 #
 # === FINAL CHECK MATCHING RULES ===
+# User enters amount + name + month only.
 # Month must match exactly.
-# User national ID MUST be different from the admin check national ID.
 # Remaining check capacity must be >= requested amount.
 # User name is not used for matching.
+# User national ID is not collected or used for matching.
 # After assignment, show the admin check's own name and national ID to the user.
 
 import asyncio
@@ -59,7 +60,10 @@ def _parse_admin_ids(value: str):
                 raise RuntimeError(f"ADMIN_IDS نامعتبر است: {item!r}")
     return result
 
-ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
+ADMIN_IDS = _parse_admin_ids(
+    os.getenv("ADMIN_IDS", "").strip()
+    or os.getenv("ADMIN_ID", "").strip()
+)
 
 # رمز /adpass نیز از Railway خوانده می‌شود.
 ADPASS_PASSWORD = os.getenv("ADPASS_PASSWORD", "").strip()
@@ -68,13 +72,18 @@ ADPASS_PASSWORD = os.getenv("ADPASS_PASSWORD", "").strip()
 PROMOTED_ADMIN_IDS = set()
 
 # فایل دیتابیس این ربات
-DB_PATH = "payments.db"
+DB_PATH = os.getenv("DB_PATH", "payments.db").strip() or "payments.db"
 
-# تنها کاربری که نقش A Content دارد
-A_CONTENT_ID = 7118132097
+# تنها کاربری که نقش A Content دارد؛ در صورت خالی بودن، این نقش غیرفعال است.
+A_CONTENT_ID_RAW = os.getenv("A_CONTENT_ID", "7118132097").strip()
+try:
+    A_CONTENT_ID = int(A_CONTENT_ID_RAW) if A_CONTENT_ID_RAW else 0
+except ValueError as exc:
+    raise RuntimeError(f"A_CONTENT_ID نامعتبر است: {A_CONTENT_ID_RAW!r}") from exc
 
 # اعداد ورودی کاربر/سقف حساب بر حسب «میلیون تومان» هستند.
 AMOUNT_MULTIPLIER = 1_000_000
+SQLITE_MAX_INTEGER = 9_223_372_036_854_775_807
 
 REMINDER_INTERVAL_SECONDS = 3600
 REMINDER_AFTER_HOURS = 24
@@ -138,8 +147,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def all_admin_ids():
+    """Return all configured + promoted admin IDs."""
+    return set(ADMIN_IDS) | set(PROMOTED_ADMIN_IDS)
+
+
+async def safe_query_answer(query, text=None, show_alert=False):
+    """Answer a callback query without letting an already-expired query crash the handler."""
+    try:
+        if text is None:
+            await query.answer()
+        else:
+            await query.answer(text, show_alert=show_alert)
+    except Exception:
+        logger.debug("Callback query answer failed", exc_info=True)
+
+
 # =========================================================
-# TELEGRAM CONNECTION - HIGH PERFORMANCE
+# TELEGRAM CONNECTION
 # =========================================================
 
 BOT_REQUEST = HTTPXRequest(
@@ -166,14 +191,14 @@ GET_UPDATES_REQUEST = HTTPXRequest(
 def db():
     conn = sqlite3.connect(
         DB_PATH,
-        timeout=10,
+        timeout=20,
     )
 
     conn.row_factory = sqlite3.Row
 
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA temp_store=MEMORY")
 
     return conn
@@ -212,17 +237,6 @@ def init_db():
         next_reminder_at TEXT
     );
 
-    CREATE INDEX IF NOT EXISTS idx_requests_user
-        ON requests(user_id);
-
-    CREATE INDEX IF NOT EXISTS idx_requests_status
-        ON requests(status);
-
-    CREATE INDEX IF NOT EXISTS idx_requests_target
-        ON requests(target_id);
-
-    CREATE INDEX IF NOT EXISTS idx_targets_active
-        ON payment_targets(active);
 
     CREATE TABLE IF NOT EXISTS check_targets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,12 +271,6 @@ def init_db():
         updated_at TEXT NOT NULL
     );
 
-    CREATE INDEX IF NOT EXISTS idx_check_targets_match
-        ON check_targets(active, month, national_id, name_key);
-    CREATE INDEX IF NOT EXISTS idx_check_requests_user
-        ON check_requests(user_id);
-    CREATE INDEX IF NOT EXISTS idx_check_requests_status
-        ON check_requests(status);
 
     CREATE TABLE IF NOT EXISTS promoted_admins (
         user_id INTEGER PRIMARY KEY,
@@ -358,6 +366,83 @@ def init_db():
             except sqlite3.OperationalError:
                 pass
 
+    # -----------------------------------------------------
+    # Check tables migration
+    # -----------------------------------------------------
+    check_target_columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(check_targets)"
+        ).fetchall()
+    }
+
+    check_target_migrations = {
+        "owner_name": "ALTER TABLE check_targets ADD COLUMN owner_name TEXT NOT NULL DEFAULT ''",
+        "name_key": "ALTER TABLE check_targets ADD COLUMN name_key TEXT NOT NULL DEFAULT ''",
+        "national_id": "ALTER TABLE check_targets ADD COLUMN national_id TEXT NOT NULL DEFAULT ''",
+        "capacity": "ALTER TABLE check_targets ADD COLUMN capacity INTEGER NOT NULL DEFAULT 0",
+        "reserved_amount": "ALTER TABLE check_targets ADD COLUMN reserved_amount INTEGER NOT NULL DEFAULT 0",
+        "approved_amount": "ALTER TABLE check_targets ADD COLUMN approved_amount INTEGER NOT NULL DEFAULT 0",
+        "month": "ALTER TABLE check_targets ADD COLUMN month INTEGER NOT NULL DEFAULT 1",
+        "active": "ALTER TABLE check_targets ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+        "created_at": "ALTER TABLE check_targets ADD COLUMN created_at TEXT",
+    }
+
+    for column, sql in check_target_migrations.items():
+        if column not in check_target_columns:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError as exc:
+                logger.exception("Failed migrating check_targets.%s", column)
+                raise RuntimeError(
+                    f"مهاجرت ستون check_targets.{column} ناموفق بود."
+                ) from exc
+
+    check_request_columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(check_requests)"
+        ).fetchall()
+    }
+
+    check_request_migrations = {
+        "user_id": "ALTER TABLE check_requests ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0",
+        "username": "ALTER TABLE check_requests ADD COLUMN username TEXT",
+        "first_name": "ALTER TABLE check_requests ADD COLUMN first_name TEXT",
+        "requester_name": "ALTER TABLE check_requests ADD COLUMN requester_name TEXT NOT NULL DEFAULT ''",
+        "requester_name_key": "ALTER TABLE check_requests ADD COLUMN requester_name_key TEXT NOT NULL DEFAULT ''",
+        "national_id": "ALTER TABLE check_requests ADD COLUMN national_id TEXT NOT NULL DEFAULT ''",
+        "amount": "ALTER TABLE check_requests ADD COLUMN amount INTEGER NOT NULL DEFAULT 0",
+        "month": "ALTER TABLE check_requests ADD COLUMN month INTEGER NOT NULL DEFAULT 1",
+        "target_id": "ALTER TABLE check_requests ADD COLUMN target_id INTEGER",
+        "owner_name_snapshot": "ALTER TABLE check_requests ADD COLUMN owner_name_snapshot TEXT",
+        "national_id_snapshot": "ALTER TABLE check_requests ADD COLUMN national_id_snapshot TEXT",
+        "status": "ALTER TABLE check_requests ADD COLUMN status TEXT NOT NULL DEFAULT 'waiting'",
+        "check_file_id": "ALTER TABLE check_requests ADD COLUMN check_file_id TEXT",
+        "check_file_type": "ALTER TABLE check_requests ADD COLUMN check_file_type TEXT",
+        "created_at": "ALTER TABLE check_requests ADD COLUMN created_at TEXT",
+        "updated_at": "ALTER TABLE check_requests ADD COLUMN updated_at TEXT",
+    }
+
+    for column, sql in check_request_migrations.items():
+        if column not in check_request_columns:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError as exc:
+                logger.exception("Failed migrating check_requests.%s", column)
+                raise RuntimeError(
+                    f"مهاجرت ستون check_requests.{column} ناموفق بود."
+                ) from exc
+
+    # Create every index only after all legacy columns exist.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_user ON requests(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_target ON requests(target_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_targets_active ON payment_targets(active)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_check_targets_match ON check_targets(active, month, national_id, name_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_check_requests_user ON check_requests(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_check_requests_status ON check_requests(status)")
+
     # برای درخواست‌های قدیمی، اگر شماره حساب زمان رزرو ذخیره نشده
     # باشد، از شماره فعلی حساب به عنوان نزدیک‌ترین مقدار ممکن استفاده می‌کنیم.
     try:
@@ -438,6 +523,9 @@ def parse_amount(value):
         if amount_toman != amount_toman.to_integral_value():
             return None
 
+        if amount_toman > Decimal(SQLITE_MAX_INTEGER):
+            return None
+
         return int(amount_toman)
 
     except (InvalidOperation, ValueError, TypeError):
@@ -445,7 +533,10 @@ def parse_amount(value):
 
 
 def fmt_amount(amount):
-    return f"{int(amount):,}"
+    try:
+        return f"{int(amount):,}"
+    except (TypeError, ValueError):
+        return "0"
 
 
 def is_admin(user_id):
@@ -489,9 +580,13 @@ def parse_iso(value):
 
 def parse_deadline(value):
     value = (value or "").strip()
+    if not value:
+        return None
     try:
         from zoneinfo import ZoneInfo
-        dt = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Tehran"))
+        dt = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(
+            tzinfo=ZoneInfo("Asia/Tehran")
+        )
         return dt.astimezone(timezone.utc).isoformat()
     except (TypeError, ValueError):
         return None
@@ -597,10 +692,7 @@ def a_content_menu():
         ],
         [
             InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests", style="primary"),
-            InlineKeyboardButton("🧾 ارسال فیش", callback_data="u_receipt", style="success"),
-        ],
-        [
-            InlineKeyboardButton("📑 چک‌های من", callback_data="u_checks", style="success"),
+            InlineKeyboardButton("📸 ارسال عکس", callback_data="u_send_photo", style="success"),
         ],
         [
             InlineKeyboardButton("🧾 فیش‌های دریافتی", callback_data="c_receipts", style="success"),
@@ -774,7 +866,9 @@ async def show_main_menu(
     text = menu_text(user)
 
     if edit:
-        await update.callback_query.edit_message_text(
+        await tracked_edit(
+            update.callback_query,
+            context,
             text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard,
@@ -863,7 +957,6 @@ async def start(update, context):
 async def get_account_menu(update, context):
     query = update.callback_query
 
-    await query.answer()
 
     clear_state(context)
 
@@ -871,7 +964,7 @@ async def get_account_menu(update, context):
 
     await tracked_edit(query, context, 
         "💰 *دریافت حساب*\n\n"
-        "مبلغ موردنظر را به تومان وارد کنید.\n\n"
+        "مبلغ موردنظر را بر حسب *میلیون تومان* وارد کنید.\n\n"
         "مثال:\n"
         "`11.5`",
         parse_mode=ParseMode.MARKDOWN,
@@ -890,8 +983,9 @@ async def receive_amount(update, context):
     if amount is None:
         await tracked_reply(update, context, 
             "❌ مبلغ نامعتبر است.\n\n"
+            "مبلغ را بر حسب *میلیون تومان* وارد کنید.\n"
             "مثال:\n"
-            "`11.5`",
+            "`11.5` یعنی ۱۱.۵ میلیون تومان.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -1137,7 +1231,7 @@ async def create_request(
         "⚠️ حساب مناسب موجود نیست."
     )
 
-    for admin_id in ADMIN_IDS:
+    for admin_id in all_admin_ids():
         try:
             await tracked_send_message(context.bot, 
                 admin_id,
@@ -1145,7 +1239,7 @@ async def create_request(
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
-            pass
+            logger.exception("Failed to send notification to admin %s", admin_id)
 
 
 # =========================================================
@@ -1154,7 +1248,6 @@ async def create_request(
 
 async def my_requests_menu(update, context):
     query = update.callback_query
-    await query.answer()
     clear_state(context)
 
     await tracked_edit(
@@ -1169,7 +1262,6 @@ async def my_requests_menu(update, context):
 
 async def my_checks_by_status(update, context, status):
     query = update.callback_query
-    await query.answer()
 
     user_id = update.effective_user.id
     status_names = {
@@ -1230,7 +1322,6 @@ async def my_requests_by_status(
     status,
 ):
     query = update.callback_query
-    await query.answer()
 
     user_id = update.effective_user.id
     status_names = {
@@ -1587,7 +1678,6 @@ async def user_check_status_select(update, context, number_text):
 async def receipt_menu(update, context):
     query = update.callback_query
 
-    await query.answer()
     clear_state(context)
 
     user_id = query.from_user.id
@@ -1596,7 +1686,8 @@ async def receipt_menu(update, context):
         SELECT id, reservation_name, first_name, amount, created_at
         FROM requests
         WHERE user_id = ?
-          AND status IN ('reserved', 'rejected')
+          AND status = 'reserved'
+          AND receipt_file_id IS NULL
         ORDER BY id DESC
         LIMIT 50
     """, (user_id,)).fetchall()
@@ -1633,7 +1724,6 @@ async def receipt_menu(update, context):
 
 async def receipt_select(update, context, request_id):
     query = update.callback_query
-    await query.answer()
 
     user_id = query.from_user.id
     conn = db()
@@ -1704,7 +1794,7 @@ async def receive_receipt(
         SELECT *
         FROM requests
         WHERE id = ?
-        AND user_id = ?
+          AND user_id = ?
     """, (
         request_id,
         user.id,
@@ -1774,7 +1864,7 @@ async def receive_receipt(
         f"💰 `{fmt_amount(request['amount'])}` تومان"
     )
 
-    for admin_id in ADMIN_IDS:
+    for admin_id in all_admin_ids():
         try:
             await tracked_send_message(context.bot, 
                 admin_id,
@@ -1797,7 +1887,7 @@ async def receive_receipt(
                 )
 
         except Exception:
-            pass
+            logger.exception("Failed to send receipt to admin %s", admin_id)
 
     # A Content هم همان فیش را دریافت می‌کند.
     if not is_admin(A_CONTENT_ID):
@@ -1821,7 +1911,7 @@ async def receive_receipt(
                     caption=f"🧾 فیش #{request_id}",
                 )
         except Exception:
-            pass
+            logger.exception("Failed to send receipt to A Content %s", A_CONTENT_ID)
 
 
 # =========================================================
@@ -1830,11 +1920,12 @@ async def receive_receipt(
 
 async def check_start(update, context):
     query = update.callback_query
-    await query.answer()
     clear_state(context)
     context.user_data['check_amount'] = True
     await tracked_edit(query, context,
-        "🧾 *ثبت چک*\n\nمبلغ چک را به تومان وارد کنید.\nمثال: `200` یعنی ۲۰۰ میلیون تومان.",
+        "🧾 *ثبت درخواست چک*\n\n"
+        "مبلغ چک را بر حسب *میلیون تومان* وارد کنید.\n"
+        "مثال: `200` یعنی ۲۰۰ میلیون تومان.",
         parse_mode=ParseMode.MARKDOWN, reply_markup=back_button())
 
 
@@ -1979,7 +2070,7 @@ async def create_check_request(update, context, amount, name, month):
         f"💰 `{fmt_amount(amount)}` تومان\n\n"
         "⚠️ چک مناسب موجود نیست و درخواست در صف انتظار است."
     )
-    for admin_id in ADMIN_IDS:
+    for admin_id in all_admin_ids():
         try:
             await tracked_send_message(
                 context.bot, admin_id, admin_text,
@@ -1987,18 +2078,111 @@ async def create_check_request(update, context, amount, name, month):
                 reply_markup=admin_menu()
             )
         except Exception:
-            pass
+            logger.exception("Failed to send notification to %s", admin_id)
+
+
+def reassign_rejected_check(conn, row):
+    """Move a rejected check request back to reserved state and clear its old image."""
+    if row["status"] != "rejected":
+        return row["target_id"], row["owner_name_snapshot"], row["national_id_snapshot"]
+
+    target = None
+    if row["target_id"]:
+        target = conn.execute(
+            """
+            SELECT *
+            FROM check_targets
+            WHERE id = ?
+              AND active = 1
+              AND month = ?
+              AND (capacity - reserved_amount - approved_amount) >= ?
+            """,
+            (row["target_id"], row["month"], row["amount"]),
+        ).fetchone()
+
+    if not target:
+        target = conn.execute(
+            """
+            SELECT *
+            FROM check_targets
+            WHERE active = 1
+              AND month = ?
+              AND (capacity - reserved_amount - approved_amount) >= ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (row["month"], row["amount"]),
+        ).fetchone()
+
+    if not target:
+        return None
+
+    now = now_iso()
+    conn.execute(
+        """
+        UPDATE check_requests
+        SET target_id = ?,
+            owner_name_snapshot = ?,
+            national_id_snapshot = ?,
+            status = 'reserved',
+            check_file_id = NULL,
+            check_file_type = NULL,
+            updated_at = ?
+        WHERE id = ? AND status = 'rejected'
+        """,
+        (
+            target["id"],
+            target["owner_name"],
+            target["national_id"],
+            now,
+            row["id"],
+        ),
+    )
+    conn.execute(
+        "UPDATE check_targets SET reserved_amount = reserved_amount + ? WHERE id = ?",
+        (row["amount"], target["id"]),
+    )
+    return target["id"], target["owner_name"], target["national_id"]
 
 
 async def check_select(update, context, request_id):
     query = update.callback_query
-    await query.answer()
     conn = db()
-    row = conn.execute('SELECT * FROM check_requests WHERE id = ? AND user_id = ?', (request_id, query.from_user.id)).fetchone()
-    conn.close()
+    conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute(
+        'SELECT * FROM check_requests WHERE id = ? AND user_id = ?',
+        (request_id, query.from_user.id),
+    ).fetchone()
     if not row or row['status'] not in ('reserved', 'rejected'):
-        await tracked_edit(query, context, '❌ این درخواست چک دیگر آماده دریافت عکس نیست.', reply_markup=back_button())
+        conn.rollback()
+        conn.close()
+        await tracked_edit(
+            query,
+            context,
+            '❌ این درخواست چک دیگر آماده دریافت عکس نیست.',
+            reply_markup=back_button(),
+        )
         return
+
+    if row["status"] == "rejected":
+        reassigned = reassign_rejected_check(conn, row)
+        if not reassigned:
+            conn.rollback()
+            conn.close()
+            await tracked_edit(
+                query,
+                context,
+                "❌ فعلاً چک مناسبی با همین ماه و ظرفیت کافی برای ارسال مجدد وجود ندارد.",
+                reply_markup=back_button(),
+            )
+            return
+        row = conn.execute(
+            "SELECT * FROM check_requests WHERE id = ? AND user_id = ?",
+            (request_id, query.from_user.id),
+        ).fetchone()
+
+    conn.commit()
+    conn.close()
     context.user_data['check_upload_request'] = request_id
     await tracked_edit(query, context,
         "📷 *ارسال عکس چک*\n\n"
@@ -2012,46 +2196,141 @@ async def receive_check_image(update, context):
     request_id = context.user_data.get('check_upload_request')
     if not request_id:
         return False
+
     user = update.effective_user
     if update.message.photo:
-        file_id = update.message.photo[-1].file_id; file_type = 'photo'
+        file_id = update.message.photo[-1].file_id
+        file_type = 'photo'
     elif update.message.document:
-        file_id = update.message.document.file_id; file_type = 'document'
+        file_id = update.message.document.file_id
+        file_type = 'document'
     else:
         return False
+
     conn = db()
-    row = conn.execute('SELECT * FROM check_requests WHERE id = ? AND user_id = ?', (request_id, user.id)).fetchone()
-    if not row or row['status'] != 'reserved' or row['check_file_id']:
-        conn.close(); context.user_data.pop('check_upload_request', None)
-        await tracked_reply(update, context, '❌ این درخواست دیگر آماده دریافت عکس چک نیست.')
+    conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute(
+        'SELECT * FROM check_requests WHERE id = ? AND user_id = ?',
+        (request_id, user.id),
+    ).fetchone()
+
+    if not row:
+        conn.rollback()
+        conn.close()
+        context.user_data.pop('check_upload_request', None)
+        await tracked_reply(update, context, '❌ این درخواست چک پیدا نشد.')
         return True
-    conn.execute("UPDATE check_requests SET check_file_id=?, check_file_type=?, status='reserved', updated_at=? WHERE id=?", (file_id, file_type, now_iso(), request_id))
-    conn.commit(); conn.close(); context.user_data.pop('check_upload_request', None)
-    await tracked_reply(update, context,
+
+    if row['status'] == 'rejected':
+        reassigned = reassign_rejected_check(conn, row)
+        if not reassigned:
+            conn.rollback()
+            conn.close()
+            context.user_data.pop('check_upload_request', None)
+            await tracked_reply(
+                update,
+                context,
+                '❌ فعلاً چک مناسبی با همین ماه و ظرفیت کافی برای ارسال مجدد وجود ندارد.',
+                reply_markup=user_menu(),
+            )
+            return True
+        row = conn.execute(
+            'SELECT * FROM check_requests WHERE id = ? AND user_id = ?',
+            (request_id, user.id),
+        ).fetchone()
+
+    if row['status'] != 'reserved' or row['check_file_id']:
+        conn.rollback()
+        conn.close()
+        context.user_data.pop('check_upload_request', None)
+        await tracked_reply(
+            update,
+            context,
+            '❌ این درخواست دیگر آماده دریافت عکس چک نیست.',
+        )
+        return True
+
+    conn.execute(
+        """
+        UPDATE check_requests
+        SET check_file_id = ?,
+            check_file_type = ?,
+            status = 'reserved',
+            updated_at = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (file_id, file_type, now_iso(), request_id, user.id),
+    )
+    conn.commit()
+    conn.close()
+    context.user_data.pop('check_upload_request', None)
+
+    await tracked_reply(
+        update,
+        context,
         f"✅ *عکس چک دریافت شد.*\n\n🆔 `{request_id}`\n⏳ برای بررسی ادمین/حسابدار ارسال شد.",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=user_menu())
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton('✅ تأیید چک', callback_data=f'check_ok_{request_id}', style='success'), InlineKeyboardButton('❌ رد چک', callback_data=f'check_no_{request_id}', style='danger')]])
-    text = ("📄 *چک جدید برای بررسی*\n\n"
-            f"🆔 `{request_id}`\n👤 `{row['requester_name']}`\n🔢 `{row['national_id']}`\n"
-            f"📅 {month_display(row['month'])}\n💰 `{fmt_amount(row['amount'])}` تومان")
-    recipients = set(ADMIN_IDS)
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=user_menu(),
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                '✅ تأیید چک',
+                callback_data=f'check_ok_{request_id}',
+                style='success',
+            ),
+            InlineKeyboardButton(
+                '❌ رد چک',
+                callback_data=f'check_no_{request_id}',
+                style='danger',
+            ),
+        ]
+    ])
+    text = (
+        "📄 *چک جدید برای بررسی*\n\n"
+        f"🆔 `{request_id}`\n"
+        f"👤 `{row['requester_name']}`\n"
+        f"🔢 `{row['national_id'] or '-'}`\n"
+        f"📅 {month_display(row['month'])}\n"
+        f"💰 `{fmt_amount(row['amount'])}` تومان"
+    )
+
+    recipients = all_admin_ids()
     if A_CONTENT_ID:
         recipients.add(A_CONTENT_ID)
+
     for staff_id in recipients:
         try:
-            await tracked_send_message(context.bot, staff_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            await tracked_send_message(
+                context.bot,
+                staff_id,
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+            )
             if file_type == 'photo':
-                await tracked_send_photo(context.bot, staff_id, file_id, caption=f'📄 عکس چک #{request_id}')
+                await tracked_send_photo(
+                    context.bot,
+                    staff_id,
+                    file_id,
+                    caption=f'📄 عکس چک #{request_id}',
+                )
             else:
-                await tracked_send_document(context.bot, staff_id, file_id, caption=f'📄 فایل چک #{request_id}')
+                await tracked_send_document(
+                    context.bot,
+                    staff_id,
+                    file_id,
+                    caption=f'📄 فایل چک #{request_id}',
+                )
         except Exception:
-            pass
+            logger.exception("Failed to send check %s to staff %s", request_id, staff_id)
+
     return True
 
 
 async def check_list(update, context, staff_only=False):
     query = update.callback_query
-    await query.answer()
     if staff_only and not is_staff(query.from_user.id):
         return
     conn = db()
@@ -2074,7 +2353,7 @@ async def check_list(update, context, staff_only=False):
 
 
 async def check_item(update, context, request_id):
-    query=update.callback_query; await query.answer()
+    query=update.callback_query
     if not is_staff(query.from_user.id): return
     conn=db(); row=conn.execute('SELECT * FROM check_requests WHERE id=? AND status="reserved" AND check_file_id IS NOT NULL',(request_id,)).fetchone(); conn.close()
     if not row:
@@ -2090,40 +2369,64 @@ async def check_item(update, context, request_id):
     try:
         if row['check_file_type']=='photo': await tracked_send_photo(context.bot, query.from_user.id, row['check_file_id'], caption=f'📄 چک #{request_id}')
         else: await tracked_send_document(context.bot, query.from_user.id, row['check_file_id'], caption=f'📄 چک #{request_id}')
-    except Exception: pass
+    except Exception:
+        logger.exception("Telegram operation failed")
 
 
 async def approve_check(update, context, request_id):
-    query=update.callback_query; await query.answer('✅ چک تأیید شد')
+    query=update.callback_query
     if not is_staff(query.from_user.id): return
     conn=db(); row=conn.execute('SELECT * FROM check_requests WHERE id=? AND status="reserved" AND check_file_id IS NOT NULL',(request_id,)).fetchone()
     if not row: conn.close(); return
-    conn.execute("UPDATE check_requests SET status='approved', updated_at=? WHERE id=?",(now_iso(),request_id))
+    cur = conn.execute(
+        "UPDATE check_requests SET status='approved', updated_at=? "
+        "WHERE id=? AND status='reserved' AND check_file_id IS NOT NULL",
+        (now_iso(), request_id),
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        return
     if row['target_id']:
         conn.execute('UPDATE check_targets SET reserved_amount=MAX(0,reserved_amount-?), approved_amount=approved_amount+? WHERE id=?',(row['amount'],row['amount'],row['target_id']))
     conn.commit(); conn.close()
     try: await query.edit_message_reply_markup(reply_markup=None)
-    except Exception: pass
+    except Exception:
+        logger.exception("Telegram operation failed")
     try: await tracked_send_message(context.bot,row['user_id'],f"✅ *چک شما تأیید شد*\n\n🆔 `{request_id}`\n💰 `{fmt_amount(row['amount'])}` تومان\n📅 {month_display(row['month'])}",parse_mode=ParseMode.MARKDOWN,reply_markup=user_menu())
-    except Exception: pass
+    except Exception:
+        logger.exception("Telegram operation failed")
 
 
 async def reject_check(update, context, request_id):
-    query=update.callback_query; await query.answer('❌ چک رد شد')
+    query=update.callback_query
     if not is_staff(query.from_user.id): return
     conn=db(); row=conn.execute('SELECT * FROM check_requests WHERE id=? AND status="reserved" AND check_file_id IS NOT NULL',(request_id,)).fetchone()
     if not row: conn.close(); return
-    conn.execute("UPDATE check_requests SET status='rejected', updated_at=? WHERE id=?",(now_iso(),request_id))
+    cur = conn.execute(
+        "UPDATE check_requests SET status='rejected', updated_at=? "
+        "WHERE id=? AND status='reserved' AND check_file_id IS NOT NULL",
+        (now_iso(), request_id),
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        return
     if row['target_id']: conn.execute('UPDATE check_targets SET reserved_amount=MAX(0,reserved_amount-?) WHERE id=?',(row['amount'],row['target_id']))
+    assigned = assign_waiting_check_requests(conn)
     conn.commit(); conn.close()
     try: await query.edit_message_reply_markup(reply_markup=None)
-    except Exception: pass
+    except Exception:
+        logger.exception("Telegram operation failed")
     try: await tracked_send_message(context.bot,row['user_id'],f"❌ *چک شما رد شد*\n\n🆔 `{request_id}`\n💰 `{fmt_amount(row['amount'])}` تومان\n📅 {month_display(row['month'])}",parse_mode=ParseMode.MARKDOWN,reply_markup=user_menu())
-    except Exception: pass
+    except Exception:
+        logger.exception("Failed to notify user %s about check rejection", row["user_id"])
+
+    await notify_assigned_check_requests(context.bot, assigned)
 
 
 async def add_check_menu(update, context):
-    query=update.callback_query; await query.answer()
+    query=update.callback_query
     if not is_admin(query.from_user.id): return
     clear_state(context); context.user_data['new_check']=True
     await tracked_edit(query,context,"➕ *افزودن چک*\n\nفرمت:\n`نام|کدملی|سقف|ماه`\n\nمثال:\n`علی رضایی|0012345678|200|9`\n\nماه فقط عدد ۱ تا ۱۲ است.",parse_mode=ParseMode.MARKDOWN,reply_markup=back_button())
@@ -2141,22 +2444,12 @@ async def process_new_check(update, context):
     now=now_iso(); conn=db()
     conn.execute('INSERT INTO check_targets(owner_name,name_key,national_id,capacity,month,created_at) VALUES(?,?,?,?,?,?)',(name,normalize_person_name(name),national_id,capacity,month,now))
     target_id=conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-    # درخواست‌های منتظر فقط با کد ملی و ماه یکسان و ظرفیت کافی تطبیق داده می‌شوند؛
-    # نام کاربر در اختصاص چک نقشی ندارد.
-    waiting=conn.execute('SELECT * FROM check_requests WHERE status="waiting" AND month=? AND amount<=? ORDER BY id ASC',(month,capacity)).fetchall()
-    assigned=[]
-    for r in waiting:
-        target=conn.execute('SELECT * FROM check_targets WHERE id=?',(target_id,)).fetchone()
-        if check_available_amount(target) < r['amount']: break
-        conn.execute("UPDATE check_requests SET target_id=?, owner_name_snapshot=?, national_id_snapshot=?, status='reserved', updated_at=? WHERE id=?",(target_id,name,national_id,now_iso(),r['id']))
-        conn.execute('UPDATE check_targets SET reserved_amount=reserved_amount+? WHERE id=?',(r['amount'],target_id))
-        assigned.append(dict(r))
+    # درخواست‌های منتظر فقط بر اساس ماه و ظرفیت آزاد تطبیق داده می‌شوند؛
+    # نام و کد ملی کاربر در تطبیق نقشی ندارند.
+    assigned = assign_waiting_check_requests(conn)
     conn.commit(); conn.close(); clear_state(context)
     await tracked_reply(update,context,f"✅ *چک ثبت شد*\n\n👤 `{name}`\n🔢 `{national_id}`\n📅 {month_display(month)}\n💰 سقف: `{fmt_amount(capacity)}` تومان\n\n🔔 تعداد درخواست‌های منتظر که خودکار به این چک اختصاص یافت: `{len(assigned)}`",parse_mode=ParseMode.MARKDOWN,reply_markup=admin_menu())
-    for r in assigned:
-        try:
-            await tracked_send_message(context.bot,r['user_id'],f"🎉 *چک مناسب برای شما پیدا شد*\n\n🆔 درخواست: `{r['id']}`\n👤 `{name}`\n🔢 `{national_id}`\n📅 {month_display(month)}\n💰 `{fmt_amount(r['amount'])}` تومان\n\nحالا عکس چک را ارسال کنید.",parse_mode=ParseMode.MARKDOWN,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('📷 ارسال عکس چک',callback_data='check_select_'+str(r['id']),style='success')],[InlineKeyboardButton('🏠 منوی اصلی',callback_data='main',style='primary')]]))
-        except Exception: pass
+    await notify_assigned_check_requests(context.bot, assigned)
     return True
 
 
@@ -2166,7 +2459,6 @@ async def process_new_check(update, context):
 
 async def a_content_receipts(update, context):
     query = update.callback_query
-    await query.answer()
 
     if not is_a_content(query.from_user.id):
         return
@@ -2210,7 +2502,6 @@ async def a_content_receipts(update, context):
 
 async def a_content_receipt_item(update, context, request_id):
     query = update.callback_query
-    await query.answer()
 
     if not is_a_content(query.from_user.id):
         return
@@ -2276,7 +2567,6 @@ async def a_content_receipt_item(update, context, request_id):
 async def approve(update, context, request_id):
     query = update.callback_query
 
-    await query.answer("✅ تأیید شد")
 
     if not is_staff(query.from_user.id):
         return
@@ -2301,7 +2591,7 @@ async def approve(update, context, request_id):
         conn.close()
         return
 
-    conn.execute("""
+    cur = conn.execute("""
         UPDATE requests
         SET status = 'paid',
             updated_at = ?,
@@ -2313,6 +2603,10 @@ async def approve(update, context, request_id):
         now_iso(),
         request_id,
     ))
+    if cur.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        return
 
     if request["target_id"]:
         conn.execute("""
@@ -2362,7 +2656,6 @@ async def approve(update, context, request_id):
 async def reject(update, context, request_id):
     query = update.callback_query
 
-    await query.answer("❌ رد شد")
 
     if not is_staff(query.from_user.id):
         return
@@ -2387,16 +2680,22 @@ async def reject(update, context, request_id):
         conn.close()
         return
 
-    conn.execute("""
+    cur = conn.execute("""
         UPDATE requests
         SET status = 'rejected',
             updated_at = ?,
             next_reminder_at = NULL
         WHERE id = ?
+          AND status = 'reserved'
+          AND receipt_file_id IS NOT NULL
     """, (
         now_iso(),
         request_id,
     ))
+    if cur.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        return
 
     if request["target_id"]:
         conn.execute("""
@@ -2412,6 +2711,7 @@ async def reject(update, context, request_id):
             request["target_id"],
         ))
 
+    assigned = assign_waiting_requests(conn)
     conn.commit()
     conn.close()
 
@@ -2432,7 +2732,9 @@ async def reject(update, context, request_id):
             reply_markup=user_menu(),
         )
     except Exception:
-        pass
+        logger.exception("Failed to notify user %s about payment rejection", request["user_id"])
+
+    await notify_assigned_account_requests(context.bot, assigned)
 
 
 # =========================================================
@@ -2442,7 +2744,6 @@ async def reject(update, context, request_id):
 async def admin_status(update, context):
     query = update.callback_query
 
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -2525,7 +2826,6 @@ async def admin_status(update, context):
 
 async def admin_target_reservations(update, context, target_id):
     query = update.callback_query
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -2595,7 +2895,6 @@ async def admin_target_reservations(update, context, target_id):
 
 async def admin_edit_target_start(update, context, target_id):
     query = update.callback_query
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -2700,12 +2999,11 @@ async def process_edit_target(update, context):
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
-            pass
+            logger.exception("Failed to send account-update notification to user %s", row["user_id"])
 
 
 async def admin_delete_target(update, context, target_id):
     query = update.callback_query
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -2758,7 +3056,6 @@ async def admin_delete_target(update, context, target_id):
 
 async def admin_delete_target_confirm(update, context, target_id):
     query = update.callback_query
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -2808,6 +3105,8 @@ async def admin_delete_target_confirm(update, context, target_id):
         "UPDATE payment_targets SET active = 0, reserved_amount = 0 WHERE id = ?",
         (target_id,),
     )
+    assigned = assign_waiting_requests(conn)
+    assigned_ids = {item[0]["id"] for item in assigned}
     conn.commit()
     conn.close()
 
@@ -2823,18 +3122,28 @@ async def admin_delete_target_confirm(update, context, target_id):
 
     for row in affected:
         try:
-            await tracked_send_message(context.bot, 
-                row["user_id"],
+            message = (
                 "⚠️ *اطلاعیه حذف شماره حساب*\n\n"
                 f"🆔 درخواست: `{row['id']}`\n"
                 f"💰 مبلغ رزرو: `{fmt_amount(row['amount'])}` تومان\n\n"
                 "شماره حسابی که برای شما رزرو شده بود از دسترس خارج شده است.\n"
-                "درخواست شما لغو نشده و دوباره در صف انتظار قرار گرفت؛ به محض پیدا شدن حساب مناسب، شماره حساب جدید برای شما ارسال می‌شود.",
+                + (
+                    "درخواست شما فعلاً در صف انتظار قرار گرفت و به محض پیدا شدن حساب مناسب، شماره حساب جدید برای شما ارسال می‌شود."
+                    if row["id"] not in assigned_ids
+                    else "درخواست شما بلافاصله به حساب مناسب دیگری منتقل شد؛ پیام اختصاص جدید را نیز دریافت خواهید کرد."
+                )
+            )
+            await tracked_send_message(
+                context.bot,
+                row["user_id"],
+                message,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=user_menu(),
             )
         except Exception:
-            pass
+            logger.exception("Failed to send delete-account notification to user %s", row["user_id"])
+
+    await notify_assigned_account_requests(context.bot, assigned)
 
 
 # =========================================================
@@ -2843,7 +3152,6 @@ async def admin_delete_target_confirm(update, context, target_id):
 
 async def admin_payment_pending(update, context):
     query = update.callback_query
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -2891,7 +3199,6 @@ async def admin_payment_pending(update, context):
 
 async def admin_payment_pending_item(update, context, request_id):
     query = update.callback_query
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -2940,7 +3247,6 @@ async def admin_payment_pending_item(update, context, request_id):
 async def admin_pending(update, context):
     query = update.callback_query
 
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -3007,7 +3313,6 @@ async def pending_item(
 ):
     query = update.callback_query
 
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -3018,6 +3323,8 @@ async def pending_item(
         SELECT *
         FROM requests
         WHERE id = ?
+          AND status = 'reserved'
+          AND receipt_file_id IS NOT NULL
     """, (
         request_id,
     )).fetchone()
@@ -3073,26 +3380,206 @@ async def pending_item(
     )
 
 
-async def assign_waiting_requests(context, conn):
+def assign_waiting_requests(conn):
+    """Assign the oldest waiting request that has any currently suitable account."""
     assigned = []
+
     while True:
-        request = conn.execute("SELECT * FROM requests WHERE status = 'waiting' ORDER BY id ASC LIMIT 1").fetchone()
-        if not request:
+        requests = conn.execute(
+            """
+            SELECT *
+            FROM requests
+            WHERE status = 'waiting'
+            ORDER BY id ASC
+            LIMIT 100
+            """
+        ).fetchall()
+
+        if not requests:
             break
-        target = conn.execute("""
-            SELECT * FROM payment_targets
-            WHERE active = 1 AND (deadline_at IS NULL OR deadline_at > ?)
-              AND (capacity - reserved_amount - paid_amount) >= ?
-            ORDER BY CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC, deadline_at ASC, id ASC
-            LIMIT 1
-        """, (now_iso(), request['amount'])).fetchone()
-        if not target:
+
+        chosen = None
+        chosen_target = None
+
+        for request in requests:
+            target = conn.execute(
+                """
+                SELECT *
+                FROM payment_targets
+                WHERE active = 1
+                  AND (deadline_at IS NULL OR deadline_at > ?)
+                  AND (capacity - reserved_amount - paid_amount) >= ?
+                ORDER BY
+                    CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
+                    deadline_at ASC,
+                    id ASC
+                LIMIT 1
+                """,
+                (now_iso(), request["amount"]),
+            ).fetchone()
+            if target:
+                chosen = request
+                chosen_target = target
+                break
+
+        if not chosen_target:
             break
+
         now = now_iso()
-        conn.execute("""UPDATE requests SET target_id=?, account_number_snapshot=?, status='reserved', updated_at=?, next_reminder_at=? WHERE id=? AND status='waiting'""", (target['id'], target['account_number'], now, reminder_due(now), request['id']))
-        conn.execute("UPDATE payment_targets SET reserved_amount=reserved_amount+? WHERE id=?", (request['amount'], target['id']))
-        assigned.append((dict(request), dict(target)))
+        cur = conn.execute(
+            """
+            UPDATE requests
+            SET target_id = ?,
+                account_number_snapshot = ?,
+                status = 'reserved',
+                updated_at = ?,
+                next_reminder_at = ?
+            WHERE id = ? AND status = 'waiting'
+            """,
+            (
+                chosen_target["id"],
+                chosen_target["account_number"],
+                now,
+                reminder_due(now),
+                chosen["id"],
+            ),
+        )
+
+        if cur.rowcount != 1:
+            continue
+
+        conn.execute(
+            "UPDATE payment_targets SET reserved_amount = reserved_amount + ? WHERE id = ?",
+            (chosen["amount"], chosen_target["id"]),
+        )
+        assigned.append((dict(chosen), dict(chosen_target)))
+
     return assigned
+
+
+async def notify_assigned_account_requests(bot, assigned):
+    """Notify users whose waiting account requests were just assigned."""
+    for request, target in assigned:
+        try:
+            await tracked_send_message(
+                bot,
+                request["user_id"],
+                "🎉 *حساب برای شما آماده شد!*\n\n"
+                f"🆔 درخواست: `{request['id']}`\n"
+                f"👤 صاحب حساب: `{target['owner_name']}`\n"
+                f"🏦 شماره حساب:\n`{target['account_number']}`\n\n"
+                f"💰 مبلغ: `{fmt_amount(request['amount'])}` تومان\n\n"
+                "پس از پرداخت، فیش را ارسال کنید.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🧾 ارسال فیش", callback_data=f"r_{request['id']}", style="success")],
+                    [InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests", style="primary")],
+                    [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
+                ]),
+            )
+        except Exception:
+            logger.exception("Failed to notify user %s about account assignment", request["user_id"])
+
+
+def assign_waiting_check_requests(conn):
+    """Assign waiting check requests to any active check with matching month/capacity."""
+    assigned = []
+
+    while True:
+        requests = conn.execute(
+            """
+            SELECT *
+            FROM check_requests
+            WHERE status = 'waiting'
+            ORDER BY id ASC
+            LIMIT 100
+            """
+        ).fetchall()
+
+        if not requests:
+            break
+
+        chosen = None
+        chosen_target = None
+
+        for request in requests:
+            target = conn.execute(
+                """
+                SELECT *
+                FROM check_targets
+                WHERE active = 1
+                  AND month = ?
+                  AND (capacity - reserved_amount - approved_amount) >= ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (request["month"], request["amount"]),
+            ).fetchone()
+            if target:
+                chosen = request
+                chosen_target = target
+                break
+
+        if not chosen_target:
+            break
+
+        now = now_iso()
+        cur = conn.execute(
+            """
+            UPDATE check_requests
+            SET target_id = ?,
+                owner_name_snapshot = ?,
+                national_id_snapshot = ?,
+                status = 'reserved',
+                check_file_id = NULL,
+                check_file_type = NULL,
+                updated_at = ?
+            WHERE id = ? AND status = 'waiting'
+            """,
+            (
+                chosen_target["id"],
+                chosen_target["owner_name"],
+                chosen_target["national_id"],
+                now,
+                chosen["id"],
+            ),
+        )
+
+        if cur.rowcount != 1:
+            continue
+
+        conn.execute(
+            "UPDATE check_targets SET reserved_amount = reserved_amount + ? WHERE id = ?",
+            (chosen["amount"], chosen_target["id"]),
+        )
+        assigned.append((dict(chosen), dict(chosen_target)))
+
+    return assigned
+
+
+async def notify_assigned_check_requests(bot, assigned):
+    """Notify users whose waiting check requests were just assigned."""
+    for request, target in assigned:
+        try:
+            await tracked_send_message(
+                bot,
+                request["user_id"],
+                "🎉 *چک مناسب برای شما پیدا شد و رزرو شد!*\n\n"
+                f"🆔 درخواست: `{request['id']}`\n"
+                f"👤 صاحب چک: `{target['owner_name']}`\n"
+                f"🔢 کد ملی صاحب چک: `{target['national_id']}`\n"
+                f"📅 {month_display(request['month'])}\n"
+                f"💰 مبلغ: `{fmt_amount(request['amount'])}` تومان\n\n"
+                "حالا عکس واضح چک را ارسال کنید.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📄 ارسال عکس چک", callback_data=f"check_select_{request['id']}", style="success")],
+                    [InlineKeyboardButton("📋 درخواست‌های من", callback_data="u_requests", style="primary")],
+                    [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main", style="primary")],
+                ]),
+            )
+        except Exception:
+            logger.exception("Failed to notify user %s about check assignment", request["user_id"])
 
 
 # =========================================================
@@ -3105,7 +3592,6 @@ async def add_account_menu(
 ):
     query = update.callback_query
 
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -3122,7 +3608,7 @@ async def add_account_menu(
         "`نام|شماره‌حساب|سقف|ددلاین`\n\n"
         "ددلاین به وقت ایران: `YYYY-MM-DD HH:MM`\n\n"
         "مثال:\n"
-        "`علی امینی|6037991234567890|11.5|2026-09-20 18:00`",
+        "`علی امینی|6037991234567890|11.5|2030-01-01 18:00`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button(),
     )
@@ -3196,7 +3682,7 @@ async def process_new_account(
 
     target_id = cursor.lastrowid
 
-    assigned = await assign_waiting_requests(context, conn)
+    assigned = assign_waiting_requests(conn)
 
     conn.commit()
     conn.close()
@@ -3215,31 +3701,7 @@ async def process_new_account(
         reply_markup=admin_menu(),
     )
 
-    # اطلاع کاربران
-    for request, target in assigned:
-        try:
-            await tracked_send_message(context.bot, 
-                request["user_id"],
-                "🎉 *حساب برای شما آماده شد!*\n\n"
-                f"🆔 درخواست: `{request['id']}`\n"
-                f"👤 صاحب حساب: `{target['owner_name']}`\n"
-                f"🏦 شماره حساب:\n"
-                f"`{target['account_number']}`\n\n"
-                f"💰 مبلغ:\n"
-                f"`{fmt_amount(request['amount'])}` تومان\n\n"
-                "پس از پرداخت، فیش را ارسال کنید.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "🧾 ارسال فیش",
-                            callback_data="u_receipt",
-                         style="success"),
-                    ],
-                ]),
-            )
-        except Exception:
-            pass
+    await notify_assigned_account_requests(context.bot, assigned)
 
 
 # =========================================================
@@ -3249,7 +3711,6 @@ async def process_new_account(
 async def history_menu(update, context):
     query = update.callback_query
 
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -3301,7 +3762,6 @@ async def history_item(
 ):
     query = update.callback_query
 
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         return
@@ -3402,13 +3862,9 @@ async def callback_router(
             return
 
     # -----------------------------------------------------
-    # جواب فوری به Telegram
+    # جواب فوری به Telegram (فقط یک بار)
     # -----------------------------------------------------
-
-    try:
-        await query.answer()
-    except Exception:
-        pass
+    await safe_query_answer(query)
 
     # -----------------------------------------------------
     # MAIN
@@ -3628,8 +4084,13 @@ async def callback_router(
         rows = conn.execute("""
             SELECT id, amount, month, status
             FROM check_requests
-            WHERE user_id = ? AND status IN ('reserved', 'rejected')
-            ORDER BY id DESC LIMIT 50
+            WHERE user_id = ?
+              AND (
+                    (status = 'reserved' AND check_file_id IS NULL)
+                    OR status = 'rejected'
+                  )
+            ORDER BY id DESC
+            LIMIT 50
         """, (query.from_user.id,)).fetchall()
         conn.close()
 
@@ -3667,20 +4128,50 @@ async def callback_router(
         try:
             request_id = int(data[len("check_upload_"):])
         except ValueError:
-            await query.answer("گزینه نامعتبر است.", show_alert=True)
+            await safe_query_answer(query, "گزینه نامعتبر است.", show_alert=True)
             return
 
         conn = db()
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM check_requests WHERE id=? AND user_id=?",
             (request_id, query.from_user.id)
         ).fetchone()
-        conn.close()
 
         if not row or row["status"] not in ("reserved", "rejected"):
-            await query.answer("این درخواست دیگر قابل ارسال عکس نیست.", show_alert=True)
+            conn.rollback()
+            conn.close()
+            await safe_query_answer(
+                query,
+                "این درخواست دیگر قابل ارسال عکس نیست.",
+                show_alert=True,
+            )
             return
 
+        if row["status"] == "reserved" and row["check_file_id"]:
+            conn.rollback()
+            conn.close()
+            await safe_query_answer(
+                query,
+                "این چک قبلاً عکس دارد و در انتظار بررسی است.",
+                show_alert=True,
+            )
+            return
+
+        if row["status"] == "rejected":
+            reassigned = reassign_rejected_check(conn, row)
+            if not reassigned:
+                conn.rollback()
+                conn.close()
+                await safe_query_answer(
+                    query,
+                    "فعلاً چک مناسبی برای ارسال مجدد وجود ندارد.",
+                    show_alert=True,
+                )
+                return
+
+        conn.commit()
+        conn.close()
         context.user_data["check_upload_request"] = request_id
         await tracked_edit(
             query, context,
@@ -3692,6 +4183,20 @@ async def callback_router(
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_button(),
         )
+        return
+
+    # -----------------------------------------------------
+    # DIRECT RECEIPT BUTTON
+    # -----------------------------------------------------
+
+    if data.startswith("r_"):
+        try:
+            request_id = int(data[2:])
+        except ValueError:
+            await safe_query_answer(query, "دکمه نامعتبر است.", show_alert=True)
+            return
+
+        await receipt_select(update, context, request_id)
         return
 
     # -----------------------------------------------------
@@ -3895,6 +4400,7 @@ async def callback_router(
                 WHERE id = ?
             """, (row['amount'], row['target_id']))
 
+        assigned = assign_waiting_requests(conn)
         conn.commit()
         conn.close()
 
@@ -3906,7 +4412,7 @@ async def callback_router(
             reply_markup=user_menu(),
         )
 
-        for admin_id in ADMIN_IDS:
+        for admin_id in all_admin_ids():
             try:
                 await tracked_send_message(context.bot, 
                     admin_id,
@@ -3914,7 +4420,9 @@ async def callback_router(
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception:
-                pass
+                logger.exception("Failed to notify admin %s about cancellation", admin_id)
+
+        await notify_assigned_account_requests(context.bot, assigned)
         return
 
     # -----------------------------------------------------
@@ -3988,6 +4496,7 @@ async def callback_router(
                 data[2:]
             )
         except ValueError:
+            await safe_query_answer(query, "دکمه نامعتبر است.", show_alert=True)
             return
 
         await history_item(
@@ -3996,6 +4505,13 @@ async def callback_router(
             target_id,
         )
         return
+
+    # هیچ callback شناخته‌شده‌ای باقی نماند.
+    await safe_query_answer(
+        query,
+        "لطفاً از منوی اصلی دوباره وارد شوید.",
+        show_alert=True,
+    )
 
 
 # =========================================================
@@ -4006,6 +4522,7 @@ async def command_getaccount(
     update,
     context,
 ):
+    clear_state(context)
     if not context.args:
         await tracked_reply(update, context, 
             "مثال:\n"
@@ -4040,6 +4557,7 @@ async def command_getaccount(
 # =========================================================
 
 async def command_receipt(update, context):
+    clear_state(context)
     user_id = update.effective_user.id
     conn = db()
     rows = conn.execute("""
@@ -4055,7 +4573,7 @@ async def command_receipt(update, context):
 
     if not rows:
         await tracked_reply(update, context, 
-            "🧾 *ارسال فیش*\\n\\n"
+            "🧾 *ارسال فیش*\n\n"
             "❌ هیچ رزروی که هنوز فیش آن ارسال نشده باشد پیدا نشد.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=user_menu(),
@@ -4075,7 +4593,7 @@ async def command_receipt(update, context):
     keyboard.append([InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary")])
 
     await tracked_reply(update, context, 
-        "🧾 *ارسال فیش*\\n\\n"
+        "🧾 *ارسال فیش*\n\n"
         "یکی از رزروهای بدون فیش را انتخاب کنید:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -4155,6 +4673,9 @@ async def send_payment_reminder(bot, row):
         [
             InlineKeyboardButton("❌ لغو درخواست", callback_data=f"cancel_payment_{row['id']}", style="danger"),
             InlineKeyboardButton("▶️ ادامه", callback_data=f"continue_payment_{row['id']}", style="success"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main", style="primary"),
         ],
     ])
 
@@ -4254,10 +4775,10 @@ async def error_handler(
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN در ابتدای فایل تنظیم نشده است.")
+        raise RuntimeError("BOT_TOKEN در Railway Environment Variables تنظیم نشده است.")
 
     if not ADMIN_IDS:
-        raise RuntimeError("حداقل یک ADMIN_ID باید در ابتدای فایل تنظیم شود.")
+        raise RuntimeError("حداقل یک ADMIN_ID یا ADMIN_IDS باید در Railway Environment Variables تنظیم شود.")
 
     init_db()
 
@@ -4284,7 +4805,7 @@ def main():
         .get_updates_request(get_updates_request)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .concurrent_updates(True)
+        .concurrent_updates(False)
         .build()
     )
 
